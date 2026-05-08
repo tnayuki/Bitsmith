@@ -1,7 +1,9 @@
+using System.Collections.Generic;
+
 namespace Bitsmith.Llvm.IR;
 
 /// <summary>
-/// Top-level LLVM module. Currently holds only header-level fields.
+/// Top-level LLVM module.
 /// </summary>
 public sealed class Module
 {
@@ -13,4 +15,13 @@ public sealed class Module
     public string InlineAsm { get; set; } = "";
 
     public TypeContext Types { get; } = new();
+
+    public List<Function> Functions { get; } = new();
+
+    public Function CreateFunction(string name, FunctionType signature, int addressSpace = 0)
+    {
+        var fn = new Function(name, signature, Types.GetPointer(addressSpace));
+        Functions.Add(fn);
+        return fn;
+    }
 }
