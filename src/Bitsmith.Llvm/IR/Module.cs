@@ -11,4 +11,6 @@ public sealed class Module
     public string ProducerString { get; set; } = "Bitsmith";
     /// <summary>Module-level inline asm (`module asm "..."`). Empty = none.</summary>
     public string InlineAsm { get; set; } = "";
+
+    public TypeContext Types { get; } = new();
 }

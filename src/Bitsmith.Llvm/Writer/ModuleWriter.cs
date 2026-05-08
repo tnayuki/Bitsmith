@@ -76,6 +76,8 @@ public sealed class ModuleWriter
         if (!string.IsNullOrEmpty(_module.InlineAsm))
             WriteAbbrevString(w, strAbbrev, ModuleCodes.Asm, _module.InlineAsm);
 
+        TypeTableWriter.Write(w, _module.Types);
+
         w.ExitBlock();
     }
 
