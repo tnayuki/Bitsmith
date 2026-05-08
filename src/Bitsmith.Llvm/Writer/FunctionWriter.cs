@@ -15,17 +15,23 @@ internal sealed class FunctionWriter
     private readonly TypeContext _types;
     private readonly IReadOnlyDictionary<Instruction, uint>? _callAttrIds;
     private readonly IReadOnlyDictionary<string, uint>? _bundleTagIds;
+    private readonly MetadataEnumerator? _me;
+    private readonly MetadataWriter? _mw;
     private Dictionary<BasicBlock, int> _bbIds = new();
 
     public FunctionWriter(BitstreamWriter w, ValueEnumerator ve, TypeContext types,
         IReadOnlyDictionary<Instruction, uint>? callAttrIds = null,
-        IReadOnlyDictionary<string, uint>? bundleTagIds = null)
+        IReadOnlyDictionary<string, uint>? bundleTagIds = null,
+        MetadataEnumerator? me = null,
+        MetadataWriter? mw = null)
     {
         _w = w;
         _ve = ve;
         _types = types;
         _callAttrIds = callAttrIds;
         _bundleTagIds = bundleTagIds;
+        _me = me;
+        _mw = mw;
     }
 
     private uint GetCallAttrId(Instruction inst) =>
@@ -92,21 +98,36 @@ internal sealed class FunctionWriter
             // ValueEnumerator. Instructions reference these via their assigned IDs.
             ConstantWriter.WriteModuleConstants(_w, _ve.FunctionConstants, _ve.GetValueId);
 
+            // Function-local METADATA_BLOCK — MdValue/DiArgList referencing args
+            // or instructions of this function. IDs continue from ModuleMetadataCount.
+            EmitFunctionLocalMetadata(fn);
+
             // InstID starts at NumModuleValues + NumArgs + NumLocalConsts.
             // It increments only for instructions whose type is not void.
             int instId = _ve.ModuleValueCount + fn.Parameters.Count + _ve.FunctionConstants.Count;
 
+            DiLocation? prevLoc = null;
             foreach (var bb in fn.BasicBlocks)
             {
                 foreach (var inst in bb.Instructions)
                 {
                     WriteInstruction(inst, instId);
+                    EmitDebugLoc(inst.DebugLocation, ref prevLoc);
                     if (inst.Type is not VoidType)
                         instId++;
                 }
             }
 
             WriteFunctionValueSymtab(fn);
+
+            // Combine the function-level subprogram attachment (the
+            // !dbg attached to the function itself) and per-instruction
+            // attachments (!invariant.load, !range, !invariant.group,
+            // !nonnull, !alias.scope, ...) into the single METADATA_
+            // ATTACHMENT_BLOCK LLVM expects per function.
+            if (_me is not null
+                && (fn.Subprogram is not null || HasAnyInstructionAttachment(fn)))
+                WriteFunctionAttachments(fn);
         }
         finally
         {
@@ -162,6 +183,82 @@ internal sealed class FunctionWriter
             }
         }
 
+        _w.ExitBlock();
+    }
+
+    private void EmitDebugLoc(DiLocation? loc, ref DiLocation? prev)
+    {
+        if (_me is null) return;
+        if (loc is null) { prev = null; return; }
+        if (ReferenceEquals(loc, prev))
+        {
+            _w.WriteUnabbrevRecord(DebugLocCodes.DebugLocAgain);
+            return;
+        }
+        _w.WriteUnabbrevRecord(DebugLocCodes.DebugLoc,
+            loc.Line,
+            loc.Column,
+            (ulong)_me.GetIdRequired(loc.Scope),
+            (ulong)_me.GetIdOrNull(loc.InlinedAt),
+            loc.IsImplicitCode ? 1UL : 0UL);
+        prev = loc;
+    }
+
+    private static bool HasAnyInstructionAttachment(Function fn)
+    {
+        foreach (var bb in fn.BasicBlocks)
+            foreach (var inst in bb.Instructions)
+                if (inst.Attachments is { Count: > 0 }) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Emit the function's METADATA_ATTACHMENT_BLOCK. Per LLVM's
+    /// bitcode format, a single block per function holds:
+    ///   1. Optional function-level record <c>[kind, mdId]</c> (the
+    ///      <c>!dbg</c> attached to the subprogram).
+    ///   2. Per-instruction records <c>[instIndex, kind, mdId, ...]</c>
+    ///      where <c>instIndex</c> is the 0-based position of the
+    ///      instruction within the function's BB stream (NOT the
+    ///      value-id used by SSA references).
+    /// </summary>
+    private void WriteFunctionAttachments(Function fn)
+    {
+        _w.EnterSubBlock(BlockIds.MetadataAttachment, 3);
+        // METADATA_ATTACHMENT operand IDs are 0-based — distinct from the 1-based
+        // encoding used by getMetadataOrNullID elsewhere.
+        if (fn.Subprogram is not null)
+        {
+            _w.WriteUnabbrevRecord(MetadataCodes.Attachment,
+                MetadataWriter.DbgKind,
+                (ulong)fn.Subprogram.Id);
+        }
+
+        // Per-instruction attachments (non-dbg). instIndex is a flat 0-based
+        // index over all instructions in BB iteration order; matches
+        // BitcodeWriter::writeMetadataAttachment in LLVM. Record layout:
+        //   [instIndex, kind_id, md_id, kind_id, md_id, ...]
+        int instIndex = 0;
+        foreach (var bb in fn.BasicBlocks)
+        {
+            foreach (var inst in bb.Instructions)
+            {
+                var atts = inst.Attachments;
+                if (atts is { Count: > 0 } && _mw is not null)
+                {
+                    var ops = new ulong[1 + atts.Count * 2];
+                    ops[0] = (ulong)instIndex;
+                    int o = 1;
+                    foreach (var (kindName, md) in atts)
+                    {
+                        ops[o++] = _mw.GetOrAllocateKindId(kindName);
+                        ops[o++] = (ulong)md.Id;
+                    }
+                    _w.WriteUnabbrevRecord(MetadataCodes.Attachment, ops);
+                }
+                instIndex++;
+            }
+        }
         _w.ExitBlock();
     }
 
@@ -263,15 +360,32 @@ internal sealed class FunctionWriter
         // callFlags: bits 0..12 calling conv, bit 13 reserved (unused), bit 14 = explicit FT.
         ulong flags = ((ulong)(inv.CallingConv & 0x1FFF))
                       | (1UL << 13);  // ExplicitType bit (LLVM 15 invoke encoding)
-        var ops = new List<ulong>(8 + inv.Arguments.Count * 2);
+        int fixedParamCount = inv.FunctionType.ParameterTypes.Count;
+        var ops = new List<ulong>(6 + 2 + fixedParamCount + (inv.Arguments.Count - fixedParamCount) * 2);
         ops.Add(GetCallAttrId(inv));
         ops.Add(flags);
         ops.Add((ulong)BbId(inv.NormalDest));
         ops.Add((ulong)BbId(inv.UnwindDest));
         ops.Add((ulong)inv.FunctionType.Id);
         PushValueAndType(inv.Callee, instId, ops);
-        foreach (var a in inv.Arguments)
-            PushValueAndType(a, instId, ops);
+
+        // LLVM 15 INVOKE / CALL writers emit *fixed* parameters with
+        // pushValue() (1 op per arg; type derived from the FunctionType
+        // slot at read time) and varargs with pushValueAndType() (1 op
+        // for backref / 2 for forward ref + explicit type). Mismatching
+        // the fixed-arg shape — for instance by always writing the type
+        // — causes the reader's post-arg `if (Record.size() != OpNum)
+        // return error("Invalid record")` check to bail when any of the
+        // args was a forward reference (since that would have written 2
+        // ops while the reader consumes only 1). Mirror the spec exactly.
+        for (int i = 0; i < fixedParamCount && i < inv.Arguments.Count; i++)
+            PushValue(inv.Arguments[i], instId, ops);
+        if (inv.FunctionType.IsVarArg)
+        {
+            for (int i = fixedParamCount; i < inv.Arguments.Count; i++)
+                PushValueAndType(inv.Arguments[i], instId, ops);
+        }
+
         _w.WriteUnabbrevRecord(FunctionCodes.InstInvoke, ops.ToArray());
     }
 
@@ -679,13 +793,30 @@ internal sealed class FunctionWriter
                       | (call.IsMustTail ? 1UL << CallFlags.MustTail : 0UL)
                       | (call.Fmf != FastMathFlags.None ? 1UL << CallFlags.Fmf : 0UL);
 
-        var ops = new List<ulong>(6 + call.Arguments.Count * 2);
+        int fixedParamCount = call.FunctionType.ParameterTypes.Count;
+        var ops = new List<ulong>(4 + 2 + fixedParamCount + (call.Arguments.Count - fixedParamCount) * 2 + 1);
         ops.Add(GetCallAttrId(call));
         ops.Add(flags);
         ops.Add((ulong)call.FunctionType.Id);
         PushValueAndType(call.Callee, instId, ops);
-        foreach (var arg in call.Arguments)
-            PushValueAndType(arg, instId, ops);
+
+        // LLVM 15 CALL writer (BitcodeWriter.cpp::writeInstruction case
+        // Instruction::Call) emits *fixed* parameters via pushValue() (1
+        // op) and varargs via pushValueAndType() (1 or 2 ops). The
+        // reader's INST_CALL handler mirrors this with getValue() for
+        // fixed args and a strict `if (Record.size() != OpNum)` check
+        // after the loop, so any extra op produced by writing a
+        // forward-ref fixed arg as a type/value pair surfaces as the
+        // generic "Invalid record" error during disassembly. Match the
+        // spec exactly so forward-ref-into-call sites round-trip.
+        for (int i = 0; i < fixedParamCount && i < call.Arguments.Count; i++)
+            PushValue(call.Arguments[i], instId, ops);
+        if (call.FunctionType.IsVarArg)
+        {
+            for (int i = fixedParamCount; i < call.Arguments.Count; i++)
+                PushValueAndType(call.Arguments[i], instId, ops);
+        }
+
         if (call.Fmf != FastMathFlags.None) ops.Add((ulong)call.Fmf);
         _w.WriteUnabbrevRecord(FunctionCodes.InstCall, ops.ToArray());
     }
@@ -758,8 +889,50 @@ internal sealed class FunctionWriter
         return id;
     }
 
+    /// <summary>Walks every instruction operand of <paramref name="fn"/> looking for
+    /// MetadataAsValue wrappers around function-local metadata (MdValue/DiArgList that
+    /// reference an Argument or Instruction of this function). Assigns IDs to them
+    /// starting at <see cref="MetadataEnumerator.ModuleMetadataCount"/> in topological
+    /// order (MdValues before any DiArgList that references them) and emits the
+    /// function-local METADATA_BLOCK via the shared <see cref="MetadataWriter"/>.</summary>
+    private void EmitFunctionLocalMetadata(Function fn)
+    {
+        if (_me is null || _mw is null) return;
+
+        var ordered = new List<Metadata>();
+        var seen = new HashSet<Metadata>(ReferenceComparer<Metadata>.Instance);
+
+        void Visit(Metadata? md)
+        {
+            if (md is null || !MetadataEnumerator.IsFunctionLocal(md)) return;
+            if (!seen.Add(md)) return;
+            if (md is DiArgList al)
+                foreach (var arg in al.Args) Visit(arg);
+            md.Id = _me.ModuleMetadataCount + ordered.Count;
+            ordered.Add(md);
+        }
+
+        foreach (var bb in fn.BasicBlocks)
+            foreach (var inst in bb.Instructions)
+                foreach (var op in inst.Operands)
+                    if (op is MetadataAsValue mav) Visit(mav.Metadata);
+
+        _mw.WriteFunctionLocalMetadataBlock(ordered);
+    }
+
     private void PushValueAndType(Value v, int instId, List<ulong> ops)
     {
+        // MetadataAsValue routes through the metadata table — only the 1-based
+        // metadata id is pushed; the reader uses the surrounding signature to
+        // recognize the operand as metadata (no type id).
+        if (v is MetadataAsValue mav)
+        {
+            if (_me is null)
+                throw new InvalidOperationException("MetadataAsValue requires a metadata enumerator");
+            ops.Add((ulong)_me.GetIdRequired(mav.Metadata));
+            return;
+        }
+
         int valId = _ve.GetValueId(v);
         ops.Add((ulong)(uint)(instId - valId));
         if (valId >= instId)
@@ -768,6 +941,14 @@ internal sealed class FunctionWriter
 
     private void PushValue(Value v, int instId, List<ulong> ops)
     {
+        if (v is MetadataAsValue mav)
+        {
+            if (_me is null)
+                throw new InvalidOperationException("MetadataAsValue requires a metadata enumerator");
+            ops.Add((ulong)_me.GetIdRequired(mav.Metadata));
+            return;
+        }
+
         int valId = _ve.GetValueId(v);
         ops.Add((ulong)(uint)(instId - valId));
     }

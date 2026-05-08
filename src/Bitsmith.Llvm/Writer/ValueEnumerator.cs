@@ -50,7 +50,141 @@ internal sealed class ValueEnumerator
             if (f.PrologueData is not null) AddConstant(f.PrologueData);
         }
 
+        // Constants referenced from MdValue (metadata-as-value) entries in any
+        // reachable metadata graph must also be enumerated so they have value IDs
+        // when the METADATA_BLOCK is written.
+        var metaSeen = new HashSet<Metadata>(ReferenceComparer<Metadata>.Instance);
+        foreach (var nm in module.NamedMetadata)
+            foreach (var op in nm.Operands)
+                CollectMdValueConstants(op, metaSeen);
+        foreach (var f in module.Functions)
+        {
+            if (f.Subprogram is not null) CollectMdValueConstants(f.Subprogram, metaSeen);
+            foreach (var bb in f.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                {
+                    if (inst.DebugLocation is not null)
+                        CollectMdValueConstants(inst.DebugLocation, metaSeen);
+                    // Non-dbg attachments (!invariant.load, !range, ...).
+                    // Their MdValue-wrapped IntegerConstants must show up
+                    // in the module-level value table because the
+                    // metadata block writer asks ValueEnumerator for
+                    // their value IDs.
+                    if (inst.Attachments is { } atts)
+                        foreach (var (_, md) in atts)
+                            CollectMdValueConstants(md, metaSeen);
+                    // MetadataAsValue arguments (dbg.declare/value/label) reach metadata
+                    // through the wrapped node; recurse so any embedded constants land
+                    // in the module-level value table before the metadata block needs them.
+                    foreach (var op in inst.Operands)
+                        if (op is MetadataAsValue mav)
+                            CollectMdValueConstants(mav.Metadata, metaSeen);
+                }
+        }
+
         _moduleValueCount = _values.Count;
+    }
+
+    private void CollectMdValueConstants(Metadata? md, HashSet<Metadata> visited)
+    {
+        if (md is null || !visited.Add(md)) return;
+        switch (md)
+        {
+            case MdValue v:
+                if (v.Value is Constant c) AddConstant(c);
+                return;
+            case MdTuple t:
+                foreach (var op in t.Operands) CollectMdValueConstants(op, visited);
+                return;
+            case DiCompileUnit cu:
+                CollectMdValueConstants(cu.File, visited);
+                CollectMdValueConstants(cu.EnumTypes, visited);
+                CollectMdValueConstants(cu.RetainedTypes, visited);
+                CollectMdValueConstants(cu.Globals, visited);
+                CollectMdValueConstants(cu.Imports, visited);
+                CollectMdValueConstants(cu.Macros, visited);
+                return;
+            case DiSubroutineType st: CollectMdValueConstants(st.Types, visited); return;
+            case DiSubprogram sp:
+                CollectMdValueConstants(sp.Scope, visited);
+                CollectMdValueConstants(sp.File, visited);
+                CollectMdValueConstants(sp.Type, visited);
+                CollectMdValueConstants(sp.Unit, visited);
+                CollectMdValueConstants(sp.RetainedNodes, visited);
+                CollectMdValueConstants(sp.Declaration, visited);
+                CollectMdValueConstants(sp.ThrownTypes, visited);
+                CollectMdValueConstants(sp.Annotations, visited);
+                CollectMdValueConstants(sp.VirtualIndex, visited);
+                return;
+            case DiLocation loc:
+                CollectMdValueConstants(loc.Scope, visited);
+                CollectMdValueConstants(loc.InlinedAt, visited);
+                return;
+            case DiDerivedType dt:
+                CollectMdValueConstants(dt.File, visited); CollectMdValueConstants(dt.Scope, visited);
+                CollectMdValueConstants(dt.BaseType, visited); CollectMdValueConstants(dt.ExtraData, visited);
+                return;
+            case DiCompositeType ct:
+                CollectMdValueConstants(ct.File, visited); CollectMdValueConstants(ct.Scope, visited);
+                CollectMdValueConstants(ct.BaseType, visited); CollectMdValueConstants(ct.Elements, visited);
+                CollectMdValueConstants(ct.VTableHolder, visited); CollectMdValueConstants(ct.TemplateParams, visited);
+                return;
+            case DiLexicalBlock lb:
+                CollectMdValueConstants(lb.Scope, visited); CollectMdValueConstants(lb.File, visited);
+                return;
+            case DiLocalVariable lv:
+                CollectMdValueConstants(lv.Scope, visited); CollectMdValueConstants(lv.File, visited);
+                CollectMdValueConstants(lv.Type, visited);
+                return;
+            case DiGenericSubrange gsr:
+                CollectMdValueConstants(gsr.Count, visited);
+                CollectMdValueConstants(gsr.LowerBound, visited);
+                CollectMdValueConstants(gsr.UpperBound, visited);
+                CollectMdValueConstants(gsr.Stride, visited);
+                return;
+            case DiMacroFile mf:
+                CollectMdValueConstants(mf.File, visited); CollectMdValueConstants(mf.Elements, visited);
+                return;
+            case DiModule mod:
+                CollectMdValueConstants(mod.Scope, visited); CollectMdValueConstants(mod.File, visited);
+                return;
+            case DiCommonBlock cb:
+                CollectMdValueConstants(cb.Scope, visited); CollectMdValueConstants(cb.Decl, visited);
+                CollectMdValueConstants(cb.File, visited);
+                return;
+            case DiObjCProperty op:
+                CollectMdValueConstants(op.File, visited); CollectMdValueConstants(op.Type, visited);
+                return;
+            case DiTemplateValueParameter tvp:
+                CollectMdValueConstants(tvp.Type, visited); CollectMdValueConstants(tvp.Value, visited);
+                return;
+            case DiTemplateTypeParameter ttp:
+                CollectMdValueConstants(ttp.Type, visited);
+                return;
+            case DiNamespace ns:
+                CollectMdValueConstants(ns.Scope, visited);
+                return;
+            case DiImportedEntity ie:
+                CollectMdValueConstants(ie.Scope, visited); CollectMdValueConstants(ie.Entity, visited);
+                CollectMdValueConstants(ie.File, visited);
+                return;
+            case DiLexicalBlockFile lbf:
+                CollectMdValueConstants(lbf.Scope, visited); CollectMdValueConstants(lbf.File, visited);
+                return;
+            case DiLabel l:
+                CollectMdValueConstants(l.Scope, visited); CollectMdValueConstants(l.File, visited);
+                return;
+            case DiGlobalVariable gv:
+                CollectMdValueConstants(gv.Scope, visited); CollectMdValueConstants(gv.File, visited);
+                CollectMdValueConstants(gv.Type, visited);
+                CollectMdValueConstants(gv.StaticDataMember, visited);
+                CollectMdValueConstants(gv.TemplateParams, visited);
+                return;
+            case DiGlobalVariableExpression gve:
+                CollectMdValueConstants(gve.Variable, visited);
+                CollectMdValueConstants(gve.Expression, visited);
+                return;
+        }
     }
 
     public int ModuleValueCount => _moduleValueCount;

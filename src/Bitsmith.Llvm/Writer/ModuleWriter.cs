@@ -176,13 +176,93 @@ public sealed class ModuleWriter
 
         ConstantWriter.WriteModuleConstants(w, ve.ModuleConstants, ve.GetValueId);
 
+        // Discover all reachable metadata: named, function subprograms, and instruction !dbg.
+        var me = new MetadataEnumerator();
+        foreach (var nm in _module.NamedMetadata)
+            foreach (var op in nm.Operands)
+                me.Add(op);
+        foreach (var gv in _module.Globals)
+            if (gv.DebugInfo is not null) me.Add(gv.DebugInfo);
+        foreach (var fn in _module.Functions)
+        {
+            if (fn.Subprogram is not null) me.Add(fn.Subprogram);
+            foreach (var bb in fn.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                {
+                    if (inst.DebugLocation is not null) me.Add(inst.DebugLocation);
+                    // Non-dbg metadata attachments (!invariant.load,
+                    // !range, !invariant.group, !nonnull, !alias.scope,
+                    // ...). The kind name → kind id mapping is allocated
+                    // when MetadataWriter walks the same instructions
+                    // below; here we only need to make sure each
+                    // attached Metadata reaches the module metadata
+                    // table so per-instruction METADATA_ATTACHMENT
+                    // records can reference its id.
+                    if (inst.Attachments is { } atts)
+                        foreach (var (_, md) in atts) me.Add(md);
+                    // MetadataAsValue arguments (e.g. dbg.declare/value/label) reach
+                    // the metadata table through their wrapped Metadata.
+                    foreach (var op in inst.Operands)
+                        if (op is MetadataAsValue mav) me.Add(mav.Metadata);
+                }
+        }
+
+        var mw = new MetadataWriter(w, me, ve);
+        bool anyDbg = HasDebugInfo();
+        bool anyAttach = HasAnyAttachment();
+        // Kind ids must be allocated *before* WriteKindBlock so the
+        // per-instruction attachment records (emitted later inside each
+        // function block) can use ids that are already declared. We
+        // pre-register every kind name observed on instructions /
+        // function subprograms so each shows up in the METADATA_KIND
+        // block exactly once, in id order.
+        if (anyAttach)
+        {
+            foreach (var fn in _module.Functions)
+                foreach (var bb in fn.BasicBlocks)
+                    foreach (var inst in bb.Instructions)
+                        if (inst.Attachments is { } atts)
+                            foreach (var (kindName, _) in atts)
+                                mw.GetOrAllocateKindId(kindName);
+        }
+        if (anyDbg || anyAttach) mw.WriteKindBlock();
+
+        var globalAttachments = new List<(GlobalVariable, DiGlobalVariableExpression)>();
+        foreach (var gv in _module.Globals)
+            if (gv.DebugInfo is not null) globalAttachments.Add((gv, gv.DebugInfo));
+
+        mw.WriteMetadataBlock(_module.NamedMetadata, globalAttachments);
+
         // Function bodies for definitions.
-        var fnWriter = new FunctionWriter(w, ve, _module.Types, callAttrIds, bundleTagIds: bundleTagIds);
+        var fnWriter = new FunctionWriter(w, ve, _module.Types, callAttrIds, bundleTagIds, me, mw);
         foreach (var fn in _module.Functions)
             if (!fn.IsDeclaration)
                 fnWriter.Write(fn);
 
         w.ExitBlock();
+    }
+
+    private bool HasDebugInfo()
+    {
+        foreach (var gv in _module.Globals)
+            if (gv.DebugInfo is not null) return true;
+        foreach (var fn in _module.Functions)
+        {
+            if (fn.Subprogram is not null) return true;
+            foreach (var bb in fn.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                    if (inst.DebugLocation is not null) return true;
+        }
+        return false;
+    }
+
+    private bool HasAnyAttachment()
+    {
+        foreach (var fn in _module.Functions)
+            foreach (var bb in fn.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                    if (inst.Attachments is { Count: > 0 }) return true;
+        return false;
     }
 
     private void WriteComdatRecord(BitstreamWriter w, Comdat c)

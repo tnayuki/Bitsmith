@@ -41,6 +41,9 @@ public sealed class Function : Constant
 
     public bool IsDeclaration => BasicBlocks.Count == 0;
 
+    /// <summary>!dbg attachment for the function itself (typically a <see cref="DiSubprogram"/>).</summary>
+    public DiSubprogram? Subprogram { get; set; }
+
     public Function(string name, FunctionType functionType, PointerType pointerType)
     {
         if (string.IsNullOrEmpty(name)) throw new ArgumentException("name required", nameof(name));

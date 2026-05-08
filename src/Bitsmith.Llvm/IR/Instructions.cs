@@ -32,6 +32,39 @@ public abstract class Instruction : Value
     /// <summary>Value operands referenced by this instruction. Used by the
     /// <c>ValueEnumerator</c> to discover function-local constants.</summary>
     public virtual IEnumerable<Value> Operands => Enumerable.Empty<Value>();
+    /// <summary>Optional !dbg attachment.</summary>
+    public DiLocation? DebugLocation { get; set; }
+
+    /// <summary>
+    /// Non-<c>!dbg</c> metadata attachments (LLVM <c>!invariant.load</c>,
+    /// <c>!invariant.group</c>, <c>!range</c>, <c>!nonnull</c>,
+    /// <c>!alias.scope</c>, <c>!noalias</c>, ...). Allocated lazily on
+    /// the first attachment so unannotated instructions stay zero-cost.
+    /// Use <see cref="AddAttachment"/> to populate. Kind IDs are
+    /// allocated by <see cref="Bitsmith.Llvm.Writer.MetadataWriter"/>
+    /// when the module is serialised.
+    /// </summary>
+    public List<(string KindName, Metadata Md)>? Attachments { get; private set; }
+
+    /// <summary>
+    /// Attach a metadata node under the given kind name (e.g.
+    /// <c>"invariant.load"</c>, <c>"range"</c>, <c>"invariant.group"</c>,
+    /// <c>"nonnull"</c>, <c>"alias.scope"</c>, <c>"noalias"</c>). The
+    /// name is mapped to a numeric kind id by the bitcode writer.
+    /// <c>!dbg</c> attachments go through <see cref="DebugLocation"/>
+    /// and must not be added through this method.
+    /// </summary>
+    public void AddAttachment(string kindName, Metadata md)
+    {
+        if (kindName is null) throw new ArgumentNullException(nameof(kindName));
+        if (md is null) throw new ArgumentNullException(nameof(md));
+        if (kindName == "dbg")
+            throw new ArgumentException(
+                "Use Instruction.DebugLocation for the 'dbg' kind.",
+                nameof(kindName));
+        Attachments ??= new List<(string, Metadata)>(1);
+        Attachments.Add((kindName, md));
+    }
 }
 
 /// <summary>
@@ -697,9 +730,40 @@ public sealed class InvokeInstruction : Instruction
         Arguments = arguments ?? Array.Empty<Value>();
         NormalDest = normalDest ?? throw new ArgumentNullException(nameof(normalDest));
         UnwindDest = unwindDest ?? throw new ArgumentNullException(nameof(unwindDest));
+
+        // Mirror the arity / type checks added to CallInstruction —
+        // INVOKE shares the same `getValue(... FTy->getParamType(i))`
+        // reader contract so the same shape mismatches surface as the
+        // generic "Invalid record" error otherwise.
+        if (!functionType.IsVarArg && arguments is { Count: var n } && n != functionType.ParameterTypes.Count)
+            throw new ArgumentException(
+                $"InvokeInstruction arity mismatch: FunctionType has {functionType.ParameterTypes.Count} parameter(s), but {n} argument(s) supplied (callee={DescribeCalleeStatic(callee)}).",
+                nameof(arguments));
+        if (functionType.IsVarArg && arguments is { Count: var nv } && nv < functionType.ParameterTypes.Count)
+            throw new ArgumentException(
+                $"InvokeInstruction arity mismatch: vararg FunctionType has {functionType.ParameterTypes.Count} fixed parameter(s), but only {nv} argument(s) supplied (callee={DescribeCalleeStatic(callee)}).",
+                nameof(arguments));
+        for (int i = 0; i < Arguments.Count; i++)
+        {
+            if (i >= functionType.ParameterTypes.Count) break;
+            var got = Arguments[i].Type;
+            var want = functionType.ParameterTypes[i];
+            if (!ReferenceEquals(got, want))
+                throw new ArgumentException(
+                    $"InvokeInstruction arg{i} type mismatch: FunctionType.ParameterTypes[{i}] expects type id={want.Id} ({want.GetType().Name}), but argument has type id={got.Id} ({got.GetType().Name}). callee={DescribeCalleeStatic(callee)}, arg.GetType()={Arguments[i].GetType().Name}.",
+                    nameof(arguments));
+        }
+
         _paramAttrs = new AttributeSet[Arguments.Count];
         for (int i = 0; i < _paramAttrs.Length; i++) _paramAttrs[i] = new AttributeSet();
     }
+
+    private static string DescribeCalleeStatic(Value v) => v switch
+    {
+        Function f => "@" + f.Name,
+        GlobalVariable g => "@" + g.Name,
+        _ => v.GetType().Name,
+    };
 
     public override LlvmType Type => FunctionType.ReturnType;
     public override IEnumerable<Value> Operands

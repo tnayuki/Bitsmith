@@ -22,6 +22,10 @@ public sealed class Module
     public List<GlobalIFunc> IFuncs { get; } = new();
     public List<Comdat> Comdats { get; } = new();
 
+    /// <summary>Module-level metadata. All <see cref="Metadata"/> reachable from any
+    /// named metadata, function attachment, or instruction !dbg is included automatically.</summary>
+    public List<NamedMetadata> NamedMetadata { get; } = new();
+
     public Function CreateFunction(string name, FunctionType signature, int addressSpace = 0)
     {
         var fn = new Function(name, signature, Types.GetPointer(addressSpace));

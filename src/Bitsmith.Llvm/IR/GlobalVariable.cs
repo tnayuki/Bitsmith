@@ -34,6 +34,9 @@ public sealed class GlobalVariable : Constant
     public string Name { get; }
     public LlvmType ValueType { get; }
     public Constant? Initializer { get; set; }
+    /// <summary>!dbg attachment — typically a <see cref="DiGlobalVariableExpression"/>.
+    /// Emitted as <c>METADATA_GLOBAL_DECL_ATTACHMENT</c> in the metadata block.</summary>
+    public DiGlobalVariableExpression? DebugInfo { get; set; }
     public bool IsConstant { get; set; }
     public Linkage Linkage { get; set; } = Linkage.External;
     public Visibility Visibility { get; set; } = Visibility.Default;

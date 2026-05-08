@@ -694,4 +694,93 @@ public class InstructionRoundtripTests
         var ll = Disassemble(module);
         Assert.Contains("define i32 @caller", ll);
     }
+
+    [SkippableFact]
+    public void Attachment_InvariantLoad_RoundTrip()
+    {
+        var module = NewModule("attach_invariant.ll");
+        var t = module.Types;
+        var i32 = t.Int32;
+        var ptr = t.GetPointer();
+        var voidT = t.Void;
+
+        var fn = module.CreateFunction("load_invariant",
+            t.GetFunction(i32, new LlvmType[] { ptr }));
+        var entry = fn.AppendBlock("entry");
+        var load = entry.Append(new LoadInstruction(i32, fn.Parameters[0], 4));
+        load.AddAttachment("invariant.load", MdTuple.Empty);
+        entry.Append(new ReturnInstruction(voidT, load));
+
+        var ll = Disassemble(module);
+        Assert.Contains("!invariant.load", ll);
+    }
+
+    [SkippableFact]
+    public void Attachment_Range_RoundTrip()
+    {
+        var module = NewModule("attach_range.ll");
+        var t = module.Types;
+        var i32 = t.Int32;
+        var ptr = t.GetPointer();
+        var voidT = t.Void;
+
+        var fn = module.CreateFunction("load_range",
+            t.GetFunction(i32, new LlvmType[] { ptr }));
+        var entry = fn.AppendBlock("entry");
+        var load = entry.Append(new LoadInstruction(i32, fn.Parameters[0], 4));
+        // !range !{i32 0, i32 256}: load returns a value in [0,256).
+        // MdValue-wrapped IntegerConstants exercise ValueEnumerator's
+        // attachment-recursion path added alongside this feature.
+        load.AddAttachment("range", new MdTuple(
+            new MdValue(new IntegerConstant(i32, 0)),
+            new MdValue(new IntegerConstant(i32, 256))));
+        entry.Append(new ReturnInstruction(voidT, load));
+
+        var ll = Disassemble(module);
+        Assert.Contains("!range", ll);
+    }
+
+    [SkippableFact]
+    public void Attachment_RejectsDbgKind()
+    {
+        var i32 = new Module().Types.Int32;
+        var inst = new BinaryOperator(
+            BinaryOpcode.Add, new IntegerConstant(i32, 1), new IntegerConstant(i32, 2));
+        Assert.Throws<System.ArgumentException>(
+            () => inst.AddAttachment("dbg", MdTuple.Empty));
+    }
+
+    [SkippableFact]
+    public void TypeTable_NamedStructForwardRef_RoundTrip()
+    {
+        // Self-referential named struct: %Node = type { %Node*, i32 }.
+        // Under opaque pointers the cycle isn't visible at the type level
+        // (the pointer is just `ptr`), so this primarily exercises that
+        // the topological sort tolerates a CreateOpaqueNamedStruct ->
+        // SetBody pattern and that the struct's id is renumbered to
+        // precede any literal struct that mentions it.
+        var module = NewModule("named_struct_cycle.ll");
+        var t = module.Types;
+        var i32 = t.Int32;
+        var ptr = t.GetPointer();
+
+        var node = t.CreateOpaqueNamedStruct("Node");
+        node.SetBody(new LlvmType[] { ptr, i32 });
+
+        // Literal struct that references the named struct, so the sort
+        // has to place %Node before { %Node, i32 }.
+        var pair = t.GetStruct(new LlvmType[] { node, i32 });
+
+        var fn = module.CreateFunction("alloc_node",
+            t.GetFunction(ptr, System.Array.Empty<LlvmType>()));
+        var entry = fn.AppendBlock("entry");
+        // alloca %Node ensures the named struct is referenced from a
+        // function body and isn't dropped by llvm-dis as unused.
+        var slot = entry.Append(new AllocaInstruction(node, new IntegerConstant(i32, 1), ptr, 8));
+        entry.Append(new ReturnInstruction(t.Void, slot));
+
+        var ll = Disassemble(module);
+        Assert.Contains("%Node = type", ll);
+        Assert.Contains("alloca %Node", ll);
+    }
 }
