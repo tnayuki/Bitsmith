@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Bitsmith.Llvm/Bitsmith.Llvm.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Bitsmith.Llvm.Tests/Bitsmith.Llvm.Tests.csproj" />
+  </Folder>
+</Solution>
