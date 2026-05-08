@@ -90,7 +90,58 @@ public sealed class ModuleWriter
         var fnAttrIds = new uint[_module.Functions.Count];
         for (int i = 0; i < _module.Functions.Count; i++)
             fnAttrIds[i] = attrs.Record(_module.Functions[i]);
+
+        // Walk every Call/Invoke in every function and register their callsite
+        // attribute sets too, so the function-block writer can reference the
+        // resulting list ids.
+        var callAttrIds = new Dictionary<Instruction, uint>(ReferenceComparer<Instruction>.Instance);
+        foreach (var fn in _module.Functions)
+            foreach (var bb in fn.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                {
+                    uint id = inst switch
+                    {
+                        CallInstruction c => attrs.Record(c),
+                        InvokeInstruction inv => attrs.Record(inv),
+                        _ => 0u,
+                    };
+                    if (id != 0) callAttrIds[inst] = id;
+                }
+
         if (attrs.HasAny) attrs.Write(w);
+
+        // OPERAND_BUNDLE_TAGS_BLOCK — assign 0-based ids to every unique tag
+        // seen on any call/invoke. Ids are referenced by the OPERAND_BUNDLE
+        // record inside the function block.
+        var bundleTagIds = new Dictionary<string, uint>(StringComparer.Ordinal);
+        foreach (var fn in _module.Functions)
+            foreach (var bb in fn.BasicBlocks)
+                foreach (var inst in bb.Instructions)
+                {
+                    var bundles = inst switch
+                    {
+                        CallInstruction c => c.Bundles,
+                        InvokeInstruction inv => inv.Bundles,
+                        _ => null,
+                    };
+                    if (bundles is null) continue;
+                    foreach (var b in bundles)
+                        if (!bundleTagIds.ContainsKey(b.Tag))
+                            bundleTagIds[b.Tag] = (uint)bundleTagIds.Count;
+                }
+        if (bundleTagIds.Count > 0)
+        {
+            w.EnterSubBlock(BlockIds.OperandBundleTags, 3);
+            foreach (var kv in bundleTagIds)
+            {
+                // OPERAND_BUNDLE_TAG = 1
+                var bytes = Encoding.UTF8.GetBytes(kv.Key);
+                var ops = new ulong[bytes.Length];
+                for (int i = 0; i < bytes.Length; i++) ops[i] = bytes[i];
+                w.WriteUnabbrevRecord(1, ops);
+            }
+            w.ExitBlock();
+        }
 
         // Comdats are referenced from globals/functions by 1-based index.
         var comdatIds = new Dictionary<Comdat, uint>(ReferenceComparer<Comdat>.Instance);
@@ -126,7 +177,7 @@ public sealed class ModuleWriter
         ConstantWriter.WriteModuleConstants(w, ve.ModuleConstants, ve.GetValueId);
 
         // Function bodies for definitions.
-        var fnWriter = new FunctionWriter(w, ve, _module.Types);
+        var fnWriter = new FunctionWriter(w, ve, _module.Types, callAttrIds, bundleTagIds: bundleTagIds);
         foreach (var fn in _module.Functions)
             if (!fn.IsDeclaration)
                 fnWriter.Write(fn);

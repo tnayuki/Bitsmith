@@ -30,15 +30,38 @@ internal sealed class AttributeTableWriter
     /// </summary>
     public uint Record(Function fn)
     {
+        return Record(fn.FunctionAttributes, fn.ReturnAttributes,
+            i => i < fn.Parameters.Count ? fn.GetParameterAttributes(i) : null,
+            fn.Parameters.Count);
+    }
+
+    /// <summary>Records callsite attribute sets for a Call/Invoke/CallBr instruction.</summary>
+    public uint Record(CallInstruction call)
+    {
+        return Record(call.FunctionAttributes, call.ReturnAttributes,
+            i => i < call.Arguments.Count ? call.GetParameterAttributes(i) : null,
+            call.Arguments.Count);
+    }
+
+    public uint Record(InvokeInstruction inv)
+    {
+        return Record(inv.FunctionAttributes, inv.ReturnAttributes,
+            i => i < inv.Arguments.Count ? inv.GetParameterAttributes(i) : null,
+            inv.Arguments.Count);
+    }
+
+    private uint Record(AttributeSet fnAttrs, AttributeSet retAttrs,
+        System.Func<int, AttributeSet?> paramAttrs, int paramCount)
+    {
         var groupIds = new List<uint>();
-        if (!fn.FunctionAttributes.IsEmpty)
-            groupIds.Add(GetOrAddGroup(FnAttrIndex, fn.FunctionAttributes));
-        if (!fn.ReturnAttributes.IsEmpty)
-            groupIds.Add(GetOrAddGroup(RetAttrIndex, fn.ReturnAttributes));
-        for (int i = 0; i < fn.Parameters.Count; i++)
+        if (!fnAttrs.IsEmpty)
+            groupIds.Add(GetOrAddGroup(FnAttrIndex, fnAttrs));
+        if (!retAttrs.IsEmpty)
+            groupIds.Add(GetOrAddGroup(RetAttrIndex, retAttrs));
+        for (int i = 0; i < paramCount; i++)
         {
-            var s = fn.GetParameterAttributes(i);
-            if (!s.IsEmpty) groupIds.Add(GetOrAddGroup((uint)(i + 1), s));
+            var s = paramAttrs(i);
+            if (s is not null && !s.IsEmpty) groupIds.Add(GetOrAddGroup((uint)(i + 1), s));
         }
         if (groupIds.Count == 0) return 0;
 
