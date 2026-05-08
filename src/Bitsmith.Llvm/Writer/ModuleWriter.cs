@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Bitsmith.Llvm.Bitstream;
 using Bitsmith.Llvm.Codes;
@@ -81,12 +82,50 @@ public sealed class ModuleWriter
 
         TypeTableWriter.Write(w, _module.Types);
 
-        // Module-level value declarations (functions only for m4).
-        foreach (var fn in _module.Functions)
-            WriteFunctionRecord(w, fn);
+        var ve = new ValueEnumerator(_module);
+
+        // PARAMATTR_GROUP_BLOCK and PARAMATTR_BLOCK come before module records
+        // so the function/global records can reference attribute-list indices.
+        var attrs = new AttributeTableWriter();
+        var fnAttrIds = new uint[_module.Functions.Count];
+        for (int i = 0; i < _module.Functions.Count; i++)
+            fnAttrIds[i] = attrs.Record(_module.Functions[i]);
+        if (attrs.HasAny) attrs.Write(w);
+
+        // Comdats are referenced from globals/functions by 1-based index.
+        var comdatIds = new Dictionary<Comdat, uint>(ReferenceComparer<Comdat>.Instance);
+        for (int i = 0; i < _module.Comdats.Count; i++)
+        {
+            var c = _module.Comdats[i];
+            comdatIds[c] = (uint)(i + 1);
+            WriteComdatRecord(w, c);
+        }
+
+        // Section names and GC strategy names get unique 1-based indices.
+        var sectionIds = new Dictionary<string, uint>(StringComparer.Ordinal);
+        var gcIds = new Dictionary<string, uint>(StringComparer.Ordinal);
+        InternSection(w, sectionIds, _module.Globals.Select(g => g.Section));
+        InternSection(w, sectionIds, _module.Functions.Select(f => f.Section));
+        InternGc(w, gcIds, _module.Functions.Select(f => f.Gc));
+
+        // GLOBALVAR / FUNCTION / ALIAS / IFUNC records first; the reader assigns
+        // value IDs in file order, so the constants block must follow these records
+        // to match the writer's enumerator order.
+        foreach (var gv in _module.Globals)
+            WriteGlobalVarRecord(w, gv, ve, sectionIds, comdatIds);
+
+        for (int i = 0; i < _module.Functions.Count; i++)
+            WriteFunctionRecord(w, _module.Functions[i], fnAttrIds[i], ve, sectionIds, gcIds, comdatIds);
+
+        foreach (var a in _module.Aliases)
+            WriteAliasRecord(w, a, ve);
+
+        foreach (var ifn in _module.IFuncs)
+            WriteIFuncRecord(w, ifn, ve);
+
+        ConstantWriter.WriteModuleConstants(w, ve.ModuleConstants, ve.GetValueId);
 
         // Function bodies for definitions.
-        var ve = new ValueEnumerator(_module);
         var fnWriter = new FunctionWriter(w, ve, _module.Types);
         foreach (var fn in _module.Functions)
             if (!fn.IsDeclaration)
@@ -95,36 +134,162 @@ public sealed class ModuleWriter
         w.ExitBlock();
     }
 
-    private void WriteFunctionRecord(BitstreamWriter w, Function fn)
+    private void WriteComdatRecord(BitstreamWriter w, Comdat c)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(c.Name);
+        var ops = new ulong[2 + nameBytes.Length];
+        ops[0] = (ulong)c.Kind;
+        ops[1] = (ulong)nameBytes.Length;
+        for (int i = 0; i < nameBytes.Length; i++) ops[2 + i] = nameBytes[i];
+        w.WriteUnabbrevRecord(ModuleCodes.Comdat, ops);
+    }
+
+    private static void InternSection(BitstreamWriter w, Dictionary<string, uint> table,
+        IEnumerable<string?> names)
+    {
+        foreach (var n in names)
+        {
+            if (string.IsNullOrEmpty(n) || table.ContainsKey(n!)) continue;
+            table[n!] = (uint)(table.Count + 1);
+            WriteStringRecord(w, ModuleCodes.SectionName, n!);
+        }
+    }
+
+    private static void InternGc(BitstreamWriter w, Dictionary<string, uint> table,
+        IEnumerable<string?> names)
+    {
+        foreach (var n in names)
+        {
+            if (string.IsNullOrEmpty(n) || table.ContainsKey(n!)) continue;
+            table[n!] = (uint)(table.Count + 1);
+            WriteStringRecord(w, ModuleCodes.GcName, n!);
+        }
+    }
+
+    private void WriteAliasRecord(BitstreamWriter w, GlobalAlias a, ValueEnumerator ve)
+    {
+        var (offset, size) = _strtab.Add(a.Name);
+        var ops = new ulong[]
+        {
+            (ulong)offset,
+            (ulong)size,
+            (ulong)a.ValueType.Id,
+            (ulong)a.AddressSpace,
+            (ulong)ve.GetValueId(a.Aliasee),
+            LinkageEncoding.Encode(a.Linkage),
+            (ulong)a.Visibility,
+            (ulong)a.DllStorageClass,
+            (ulong)a.ThreadLocal,
+            (ulong)a.UnnamedAddr,
+            a.IsDsoLocal ? 1UL : 0UL,
+        };
+        w.WriteUnabbrevRecord(ModuleCodes.Alias, ops);
+    }
+
+    private void WriteIFuncRecord(BitstreamWriter w, GlobalIFunc ifn, ValueEnumerator ve)
+    {
+        var (offset, size) = _strtab.Add(ifn.Name);
+        var ops = new ulong[]
+        {
+            (ulong)offset,
+            (ulong)size,
+            (ulong)ifn.ValueType.Id,
+            (ulong)ifn.AddressSpace,
+            (ulong)ve.GetValueId(ifn.Resolver),
+            LinkageEncoding.Encode(ifn.Linkage),
+            (ulong)ifn.Visibility,
+        };
+        w.WriteUnabbrevRecord(ModuleCodes.IFunc, ops);
+    }
+
+    /// <summary>Unabbrev fallback for string records (e.g. SectionName/GcName) emitted
+    /// outside the local string-record abbrev's scope.</summary>
+    private static void WriteStringRecord(BitstreamWriter w, uint code, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        var ops = new ulong[bytes.Length];
+        for (int i = 0; i < bytes.Length; i++) ops[i] = bytes[i];
+        w.WriteUnabbrevRecord(code, ops);
+    }
+
+    private void WriteGlobalVarRecord(BitstreamWriter w, GlobalVariable gv, ValueEnumerator ve,
+        Dictionary<string, uint> sectionIds, Dictionary<Comdat, uint> comdatIds)
+    {
+        var (offset, size) = _strtab.Add(gv.Name);
+
+        ulong rawFlags = (gv.IsConstant ? 1UL : 0UL)
+            | 2UL
+            | ((ulong)((PointerType)gv.Type).AddressSpace << 2);
+
+        ulong initId = gv.Initializer is null ? 0UL : (ulong)(ve.GetValueId(gv.Initializer) + 1);
+        ulong align = gv.Alignment == 0 ? 0UL : (ulong)(Log2(gv.Alignment) + 1);
+        ulong sectionId = (gv.Section is not null && sectionIds.TryGetValue(gv.Section, out var sid)) ? sid : 0UL;
+        ulong comdatId = (gv.Comdat is not null && comdatIds.TryGetValue(gv.Comdat, out var cid)) ? cid : 0UL;
+
+        var ops = new ulong[]
+        {
+            (ulong)offset,
+            (ulong)size,
+            (ulong)gv.ValueType.Id,
+            rawFlags,
+            initId,
+            LinkageEncoding.Encode(gv.Linkage),
+            align,
+            sectionId,
+            (ulong)gv.Visibility,
+            (ulong)gv.ThreadLocal,
+            (ulong)gv.UnnamedAddr,
+            gv.ExternallyInitialized ? 1UL : 0UL,
+            (ulong)gv.DllStorageClass,
+            comdatId,
+            0,                                  // attributes (not yet wired)
+            gv.IsDsoLocal ? 1UL : 0UL,
+        };
+        w.WriteUnabbrevRecord(ModuleCodes.GlobalVar, ops);
+    }
+
+    private static int Log2(uint v)
+    {
+        int r = 0;
+        while ((v >>= 1) != 0) r++;
+        return r;
+    }
+
+    private void WriteFunctionRecord(BitstreamWriter w, Function fn, uint attrListId,
+        ValueEnumerator ve, Dictionary<string, uint> sectionIds, Dictionary<string, uint> gcIds,
+        Dictionary<Comdat, uint> comdatIds)
     {
         var (offset, size) = _strtab.Add(fn.Name);
 
-        // FUNCTION:
-        //   [strtab_offset, strtab_size, type, callingconv, isproto, linkage,
-        //    paramattr, alignment, section, visibility, gc, unnamed_addr,
-        //    prologuedata, dllstorageclass, comdat, prefixdata, personalityfn,
-        //    DSO_Local, addrspace]
+        ulong align = fn.Alignment == 0 ? 0UL : (ulong)(Log2(fn.Alignment) + 1);
+        ulong sectionId = (fn.Section is not null && sectionIds.TryGetValue(fn.Section, out var sid)) ? sid : 0UL;
+        ulong gcId = (fn.Gc is not null && gcIds.TryGetValue(fn.Gc, out var gid)) ? gid : 0UL;
+        ulong comdatId = (fn.Comdat is not null && comdatIds.TryGetValue(fn.Comdat, out var cid)) ? cid : 0UL;
+        ulong prefixId = fn.PrefixData is null ? 0UL : (ulong)(ve.GetValueId(fn.PrefixData) + 1);
+        ulong prologueId = fn.PrologueData is null ? 0UL : (ulong)(ve.GetValueId(fn.PrologueData) + 1);
+        ulong personalityId = fn.Personality is null ? 0UL : (ulong)(ve.GetValueId(fn.Personality) + 1);
+
         var ops = new ulong[]
         {
             (ulong)offset,
             (ulong)size,
             (ulong)fn.FunctionType.Id,
-            0,                          // callingconv (C)
-            fn.IsDeclaration ? 1u : 0u, // isproto
-            LinkageCodes.External,      // linkage
-            0,                          // paramattr
-            0,                          // alignment
-            0,                          // section
-            0,                          // visibility
-            0,                          // gc
-            0,                          // unnamed_addr
-            0,                          // prologuedata
-            0,                          // dllstorageclass
-            0,                          // comdat
-            0,                          // prefixdata
-            0,                          // personalityfn
-            0,                          // DSO_Local
-            0,                          // addrspace
+            fn.CallingConv,
+            fn.IsDeclaration ? 1u : 0u,
+            LinkageEncoding.Encode(fn.Linkage),
+            attrListId,
+            align,
+            sectionId,
+            (ulong)fn.Visibility,
+            gcId,
+            (ulong)fn.UnnamedAddr,
+            prologueId,
+            (ulong)fn.DllStorageClass,
+            comdatId,
+            prefixId,
+            personalityId,
+            fn.IsDsoLocal ? 1UL : 0UL,
+            (ulong)((PointerType)fn.Type).AddressSpace,
         };
         w.WriteUnabbrevRecord(ModuleCodes.Function, ops);
     }

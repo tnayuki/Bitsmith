@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace Bitsmith.Llvm.IR;
 
@@ -27,6 +29,9 @@ public abstract class Instruction : Value
 {
     public BasicBlock? Parent { get; internal set; }
     public string? Name { get; set; }
+    /// <summary>Value operands referenced by this instruction. Used by the
+    /// <c>ValueEnumerator</c> to discover function-local constants.</summary>
+    public virtual IEnumerable<Value> Operands => Enumerable.Empty<Value>();
 }
 
 /// <summary>
@@ -74,6 +79,7 @@ public sealed class BinaryOperator : Instruction
     }
 
     public override LlvmType Type => Left.Type;
+    public override IEnumerable<Value> Operands { get { yield return Left; yield return Right; } }
 }
 
 public sealed class ReturnInstruction : Instruction
@@ -88,4 +94,8 @@ public sealed class ReturnInstruction : Instruction
     }
 
     public override LlvmType Type => _voidType;
+    public override IEnumerable<Value> Operands
+    {
+        get { if (ReturnValue is not null) yield return ReturnValue; }
+    }
 }

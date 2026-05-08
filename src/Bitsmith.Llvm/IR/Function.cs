@@ -7,12 +7,35 @@ namespace Bitsmith.Llvm.IR;
 /// Module-level function. As a value it has pointer type (LLVM 15 opaque pointer);
 /// the underlying function signature is exposed via <see cref="FunctionType"/>.
 /// </summary>
-public sealed class Function : Value
+public sealed class Function : Constant
 {
     public string Name { get; }
     public FunctionType FunctionType { get; }
     public IReadOnlyList<Argument> Parameters { get; }
     public List<BasicBlock> BasicBlocks { get; } = new();
+
+    public Linkage Linkage { get; set; } = Linkage.External;
+    public Visibility Visibility { get; set; } = Visibility.Default;
+    public UnnamedAddrKind UnnamedAddr { get; set; } = UnnamedAddrKind.None;
+    public uint Alignment { get; set; }
+    public DllStorageClass DllStorageClass { get; set; } = DllStorageClass.Default;
+    public bool IsDsoLocal { get; set; }
+    /// <summary>Calling convention encoded value (0 = C). Matches LLVM <c>CallingConv::ID</c>.</summary>
+    public uint CallingConv { get; set; }
+    public string? Section { get; set; }
+    public string? Gc { get; set; }
+    public Comdat? Comdat { get; set; }
+    public Constant? PrefixData { get; set; }
+    public Constant? PrologueData { get; set; }
+    public Function? Personality { get; set; }
+
+    /// <summary>Function-level attributes (apply to the function as a whole).</summary>
+    public AttributeSet FunctionAttributes { get; } = new();
+    /// <summary>Attributes attached to the function's return value.</summary>
+    public AttributeSet ReturnAttributes { get; } = new();
+    private readonly AttributeSet[] _paramAttrs;
+    /// <summary>Attribute set for parameter <paramref name="index"/> (created lazily).</summary>
+    public AttributeSet GetParameterAttributes(int index) => _paramAttrs[index];
 
     private readonly PointerType _ptrType;
 
@@ -26,8 +49,12 @@ public sealed class Function : Value
         _ptrType = pointerType ?? throw new ArgumentNullException(nameof(pointerType));
 
         var args = new Argument[functionType.ParameterTypes.Count];
+        _paramAttrs = new AttributeSet[args.Length];
         for (int i = 0; i < args.Length; i++)
+        {
             args[i] = new Argument(functionType.ParameterTypes[i], i);
+            _paramAttrs[i] = new AttributeSet();
+        }
         Parameters = args;
     }
 

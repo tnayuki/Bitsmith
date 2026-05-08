@@ -42,11 +42,13 @@ internal sealed class FunctionWriter
 
             _w.WriteAbbrevRecord(_declareBlocksAbbrev, (ulong)fn.BasicBlocks.Count);
 
-            // No function-local CONSTANTS_BLOCK or METADATA_BLOCK yet (none needed for the m4 example).
+            // Function-local CONSTANTS_BLOCK — operand-side constants discovered by
+            // ValueEnumerator. Instructions reference these via their assigned IDs.
+            ConstantWriter.WriteModuleConstants(_w, _ve.FunctionConstants, _ve.GetValueId);
 
             // InstID starts at NumModuleValues + NumArgs + NumLocalConsts.
             // It increments only for instructions whose type is not void.
-            int instId = _ve.ModuleValueCount + fn.Parameters.Count;
+            int instId = _ve.ModuleValueCount + fn.Parameters.Count + _ve.FunctionConstants.Count;
 
             foreach (var bb in fn.BasicBlocks)
             {
