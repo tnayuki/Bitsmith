@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace Bitsmith.Llvm.IR;
 
@@ -31,7 +30,7 @@ public abstract class Instruction : Value
     public string? Name { get; set; }
     /// <summary>Value operands referenced by this instruction. Used by the
     /// <c>ValueEnumerator</c> to discover function-local constants.</summary>
-    public virtual IEnumerable<Value> Operands => Enumerable.Empty<Value>();
+    public virtual ReadOnlySpan<Value> Operands => ReadOnlySpan<Value>.Empty;
     /// <summary>Optional !dbg attachment.</summary>
     public DiLocation? DebugLocation { get; set; }
 
@@ -100,6 +99,8 @@ public sealed class BinaryOperator : Instruction
     /// <summary>Fast-math flags; valid only on floating-point operands.</summary>
     public FastMathFlags Fmf { get; set; }
 
+    private readonly Value[] _operands;
+
     public BinaryOperator(BinaryOpcode opcode, Value left, Value right)
     {
         if (left is null) throw new ArgumentNullException(nameof(left));
@@ -109,10 +110,11 @@ public sealed class BinaryOperator : Instruction
         Opcode = opcode;
         Left = left;
         Right = right;
+        _operands = new[] { left, right };
     }
 
     public override LlvmType Type => Left.Type;
-    public override IEnumerable<Value> Operands { get { yield return Left; yield return Right; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class ReturnInstruction : Instruction
@@ -120,17 +122,17 @@ public sealed class ReturnInstruction : Instruction
     private readonly LlvmType _voidType;
     public Value? ReturnValue { get; }
 
+    private readonly Value[] _operands;
+
     public ReturnInstruction(LlvmType voidType, Value? returnValue = null)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         ReturnValue = returnValue;
+        _operands = returnValue is null ? Array.Empty<Value>() : new[] { returnValue };
     }
 
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands
-    {
-        get { if (ReturnValue is not null) yield return ReturnValue; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class BranchInstruction : Instruction
@@ -141,10 +143,13 @@ public sealed class BranchInstruction : Instruction
     public Value? Condition { get; }
     public bool IsConditional => FalseTarget is not null;
 
+    private readonly Value[] _operands;
+
     public BranchInstruction(LlvmType voidType, BasicBlock target)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         TrueTarget = target ?? throw new ArgumentNullException(nameof(target));
+        _operands = Array.Empty<Value>();
     }
 
     public BranchInstruction(LlvmType voidType, Value condition, BasicBlock trueTarget, BasicBlock falseTarget)
@@ -153,13 +158,11 @@ public sealed class BranchInstruction : Instruction
         Condition = condition ?? throw new ArgumentNullException(nameof(condition));
         TrueTarget = trueTarget ?? throw new ArgumentNullException(nameof(trueTarget));
         FalseTarget = falseTarget ?? throw new ArgumentNullException(nameof(falseTarget));
+        _operands = new[] { condition };
     }
 
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands
-    {
-        get { if (Condition is not null) yield return Condition; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class SwitchInstruction : Instruction
@@ -176,19 +179,28 @@ public sealed class SwitchInstruction : Instruction
         DefaultDest = defaultDest ?? throw new ArgumentNullException(nameof(defaultDest));
     }
 
+    private Value[]? _operandsCache;
+
     public SwitchInstruction AddCase(IntegerConstant caseValue, BasicBlock dest)
     {
         Cases.Add((caseValue, dest));
+        _operandsCache = null;
         return this;
     }
 
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands
+    public override ReadOnlySpan<Value> Operands
     {
         get
         {
-            yield return Condition;
-            foreach (var (cv, _) in Cases) yield return cv;
+            if (_operandsCache is null)
+            {
+                var arr = new Value[1 + Cases.Count];
+                arr[0] = Condition;
+                for (int i = 0; i < Cases.Count; i++) arr[i + 1] = Cases[i].Value;
+                _operandsCache = arr;
+            }
+            return _operandsCache;
         }
     }
 }
@@ -202,7 +214,8 @@ public sealed class IndirectBrInstruction : Instruction
     private readonly LlvmType _voidType;
     public Value Address { get; }
     public IReadOnlyList<BasicBlock> PossibleTargets { get; }
-    public override IEnumerable<Value> Operands { get { yield return Address; } }
+    private readonly Value[] _operands;
+    public override ReadOnlySpan<Value> Operands => _operands;
     public override LlvmType Type => _voidType;
     public IndirectBrInstruction(LlvmType voidType, Value address,
         IReadOnlyList<BasicBlock> possibleTargets)
@@ -210,6 +223,7 @@ public sealed class IndirectBrInstruction : Instruction
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         Address = address ?? throw new ArgumentNullException(nameof(address));
         PossibleTargets = possibleTargets ?? throw new ArgumentNullException(nameof(possibleTargets));
+        _operands = new[] { address };
     }
 }
 
@@ -232,16 +246,19 @@ public sealed class AllocaInstruction : Instruction
     public bool IsSwiftError { get; set; }
     private readonly PointerType _ptrType;
 
+    private readonly Value[] _operands;
+
     public AllocaInstruction(LlvmType allocatedType, Value numElements, PointerType pointerType, uint alignment = 0)
     {
         AllocatedType = allocatedType ?? throw new ArgumentNullException(nameof(allocatedType));
         NumElements = numElements ?? throw new ArgumentNullException(nameof(numElements));
         _ptrType = pointerType ?? throw new ArgumentNullException(nameof(pointerType));
         Alignment = alignment;
+        _operands = new[] { numElements };
     }
 
     public override LlvmType Type => _ptrType;
-    public override IEnumerable<Value> Operands { get { yield return NumElements; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class LoadInstruction : Instruction
@@ -253,16 +270,19 @@ public sealed class LoadInstruction : Instruction
     public uint Ordering { get; set; }                // 0 = not atomic
     public uint SyncScope { get; set; } = Codes.SyncScope.System;
 
+    private readonly Value[] _operands;
+
     public LoadInstruction(LlvmType resultType, Value pointer, uint alignment = 0)
     {
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
         Pointer = pointer ?? throw new ArgumentNullException(nameof(pointer));
         Alignment = alignment;
+        _operands = new[] { pointer };
     }
 
     public bool IsAtomic => Ordering != 0;
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands { get { yield return Pointer; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class StoreInstruction : Instruction
@@ -275,17 +295,20 @@ public sealed class StoreInstruction : Instruction
     public uint Ordering { get; set; }
     public uint SyncScope { get; set; } = Codes.SyncScope.System;
 
+    private readonly Value[] _operands;
+
     public StoreInstruction(LlvmType voidType, Value pointer, Value storedValue, uint alignment = 0)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         Pointer = pointer ?? throw new ArgumentNullException(nameof(pointer));
         StoredValue = storedValue ?? throw new ArgumentNullException(nameof(storedValue));
         Alignment = alignment;
+        _operands = new[] { pointer, storedValue };
     }
 
     public bool IsAtomic => Ordering != 0;
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands { get { yield return Pointer; yield return StoredValue; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CastInstruction : Instruction
@@ -294,15 +317,18 @@ public sealed class CastInstruction : Instruction
     public uint Opcode { get; }
     public Value Operand { get; }
 
+    private readonly Value[] _operands;
+
     public CastInstruction(uint opcode, Value operand, LlvmType destType)
     {
         Opcode = opcode;
         Operand = operand ?? throw new ArgumentNullException(nameof(operand));
         _destType = destType ?? throw new ArgumentNullException(nameof(destType));
+        _operands = new[] { operand };
     }
 
     public override LlvmType Type => _destType;
-    public override IEnumerable<Value> Operands { get { yield return Operand; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CompareInstruction : Instruction
@@ -312,19 +338,22 @@ public sealed class CompareInstruction : Instruction
     public Value Left { get; }
     public Value Right { get; }
 
+    private readonly Value[] _operands;
+
     public CompareInstruction(uint predicate, Value left, Value right, LlvmType resultType)
     {
         Predicate = predicate;
         Left = left ?? throw new ArgumentNullException(nameof(left));
         Right = right ?? throw new ArgumentNullException(nameof(right));
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { left, right };
     }
 
     /// <summary>fast-math flags; only meaningful for fcmp.</summary>
     public FastMathFlags Fmf { get; set; }
 
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands { get { yield return Left; yield return Right; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class GetElementPtrInstruction : Instruction
@@ -335,19 +364,22 @@ public sealed class GetElementPtrInstruction : Instruction
     public IReadOnlyList<Value> Indices { get; }
     public bool IsInBounds { get; set; }
 
+    private readonly Value[] _operands;
+
     public GetElementPtrInstruction(LlvmType sourceElementType, Value pointer, IReadOnlyList<Value> indices, PointerType pointerType)
     {
         SourceElementType = sourceElementType ?? throw new ArgumentNullException(nameof(sourceElementType));
         Pointer = pointer ?? throw new ArgumentNullException(nameof(pointer));
         Indices = indices ?? throw new ArgumentNullException(nameof(indices));
         _ptrType = pointerType ?? throw new ArgumentNullException(nameof(pointerType));
+        var arr = new Value[1 + Indices.Count];
+        arr[0] = pointer;
+        for (int i = 0; i < Indices.Count; i++) arr[i + 1] = Indices[i];
+        _operands = arr;
     }
 
     public override LlvmType Type => _ptrType;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Pointer; foreach (var i in Indices) yield return i; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class PhiInstruction : Instruction
@@ -360,18 +392,30 @@ public sealed class PhiInstruction : Instruction
         _type = type ?? throw new ArgumentNullException(nameof(type));
     }
 
+    private Value[]? _operandsCache;
+
     public PhiInstruction AddIncoming(Value value, BasicBlock block)
     {
         if (!ReferenceEquals(value.Type, _type))
             throw new ArgumentException("phi incoming value type must match phi type");
         Incomings.Add((value, block));
+        _operandsCache = null;
         return this;
     }
 
     public override LlvmType Type => _type;
-    public override IEnumerable<Value> Operands
+    public override ReadOnlySpan<Value> Operands
     {
-        get { foreach (var (v, _) in Incomings) yield return v; }
+        get
+        {
+            if (_operandsCache is null)
+            {
+                var arr = new Value[Incomings.Count];
+                for (int i = 0; i < Incomings.Count; i++) arr[i] = Incomings[i].Value;
+                _operandsCache = arr;
+            }
+            return _operandsCache;
+        }
     }
 }
 
@@ -381,6 +425,8 @@ public sealed class SelectInstruction : Instruction
     public Value TrueValue { get; }
     public Value FalseValue { get; }
 
+    private readonly Value[] _operands;
+
     public SelectInstruction(Value condition, Value trueValue, Value falseValue)
     {
         if (!ReferenceEquals(trueValue.Type, falseValue.Type))
@@ -388,13 +434,11 @@ public sealed class SelectInstruction : Instruction
         Condition = condition ?? throw new ArgumentNullException(nameof(condition));
         TrueValue = trueValue;
         FalseValue = falseValue;
+        _operands = new[] { condition, trueValue, falseValue };
     }
 
     public override LlvmType Type => TrueValue.Type;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Condition; yield return TrueValue; yield return FalseValue; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 /// <summary>Operand bundle attached to a call/invoke. The runtime semantics depend on the tag
@@ -430,6 +474,9 @@ public sealed class CallInstruction : Instruction
     public AttributeSet GetParameterAttributes(int index) => _paramAttrs[index];
 
     public List<OperandBundle> Bundles { get; } = new();
+
+    private Value[]? _operandsCache;
+    private int _operandsCacheBundleStamp = -1;
 
     public CallInstruction(FunctionType functionType, Value callee, IReadOnlyList<Value> arguments)
     {
@@ -479,13 +526,28 @@ public sealed class CallInstruction : Instruction
     };
 
     public override LlvmType Type => FunctionType.ReturnType;
-    public override IEnumerable<Value> Operands
+    public override ReadOnlySpan<Value> Operands
     {
         get
         {
-            yield return Callee;
-            foreach (var a in Arguments) yield return a;
-            foreach (var b in Bundles) foreach (var v in b.Inputs) yield return v;
+            int stamp = Bundles.Count;
+            if (_operandsCache is null || _operandsCacheBundleStamp != stamp)
+            {
+                int total = 1 + Arguments.Count;
+                for (int i = 0; i < Bundles.Count; i++) total += Bundles[i].Inputs.Count;
+                var arr = new Value[total];
+                int idx = 0;
+                arr[idx++] = Callee;
+                for (int i = 0; i < Arguments.Count; i++) arr[idx++] = Arguments[i];
+                for (int i = 0; i < Bundles.Count; i++)
+                {
+                    var inputs = Bundles[i].Inputs;
+                    for (int j = 0; j < inputs.Count; j++) arr[idx++] = inputs[j];
+                }
+                _operandsCache = arr;
+                _operandsCacheBundleStamp = stamp;
+            }
+            return _operandsCache;
         }
     }
 }
@@ -496,6 +558,8 @@ public sealed class ExtractElementInstruction : Instruction
     public Value Index { get; }
     private readonly LlvmType _elementType;
 
+    private readonly Value[] _operands;
+
     public ExtractElementInstruction(Value vector, Value index)
     {
         Vector = vector ?? throw new ArgumentNullException(nameof(vector));
@@ -503,10 +567,11 @@ public sealed class ExtractElementInstruction : Instruction
         if (vector.Type is not VectorType vt)
             throw new ArgumentException("extractelement requires a vector operand");
         _elementType = vt.ElementType;
+        _operands = new[] { vector, index };
     }
 
     public override LlvmType Type => _elementType;
-    public override IEnumerable<Value> Operands { get { yield return Vector; yield return Index; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class InsertElementInstruction : Instruction
@@ -515,6 +580,8 @@ public sealed class InsertElementInstruction : Instruction
     public Value Element { get; }
     public Value Index { get; }
 
+    private readonly Value[] _operands;
+
     public InsertElementInstruction(Value vector, Value element, Value index)
     {
         Vector = vector ?? throw new ArgumentNullException(nameof(vector));
@@ -522,13 +589,11 @@ public sealed class InsertElementInstruction : Instruction
         Index = index ?? throw new ArgumentNullException(nameof(index));
         if (vector.Type is not VectorType)
             throw new ArgumentException("insertelement requires a vector operand");
+        _operands = new[] { vector, element, index };
     }
 
     public override LlvmType Type => Vector.Type;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Vector; yield return Element; yield return Index; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class ShuffleVectorInstruction : Instruction
@@ -538,19 +603,19 @@ public sealed class ShuffleVectorInstruction : Instruction
     public Value Vector2 { get; }
     public Value Mask { get; }
 
+    private readonly Value[] _operands;
+
     public ShuffleVectorInstruction(Value v1, Value v2, Value mask, VectorType resultType)
     {
         Vector1 = v1 ?? throw new ArgumentNullException(nameof(v1));
         Vector2 = v2 ?? throw new ArgumentNullException(nameof(v2));
         Mask = mask ?? throw new ArgumentNullException(nameof(mask));
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { v1, v2, mask };
     }
 
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Vector1; yield return Vector2; yield return Mask; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class FenceInstruction : Instruction
@@ -579,6 +644,8 @@ public sealed class AtomicRmwInstruction : Instruction
     public bool IsVolatile { get; set; }
     public uint Alignment { get; set; }
 
+    private readonly Value[] _operands;
+
     public AtomicRmwInstruction(uint operation, Value pointer, Value value, uint ordering, LlvmType resultType)
     {
         Operation = operation;
@@ -586,10 +653,11 @@ public sealed class AtomicRmwInstruction : Instruction
         Value = value ?? throw new ArgumentNullException(nameof(value));
         Ordering = ordering;
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { pointer, value };
     }
 
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands { get { yield return Pointer; yield return Value; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CmpXchgInstruction : Instruction
@@ -605,6 +673,8 @@ public sealed class CmpXchgInstruction : Instruction
     public bool IsWeak { get; set; }
     public uint Alignment { get; set; }
 
+    private readonly Value[] _operands;
+
     public CmpXchgInstruction(Value pointer, Value compare, Value newVal, uint successOrdering, uint failureOrdering, StructType resultType)
     {
         Pointer = pointer ?? throw new ArgumentNullException(nameof(pointer));
@@ -613,13 +683,11 @@ public sealed class CmpXchgInstruction : Instruction
         SuccessOrdering = successOrdering;
         FailureOrdering = failureOrdering;
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { pointer, compare, newVal };
     }
 
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Pointer; yield return Compare; yield return New; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public enum UnaryOpcode
@@ -633,25 +701,30 @@ public sealed class UnaryOperator : Instruction
     public Value Operand { get; }
     public FastMathFlags Fmf { get; set; }
 
+    private readonly Value[] _operands;
+
     public UnaryOperator(UnaryOpcode opcode, Value operand)
     {
         Opcode = opcode;
         Operand = operand ?? throw new ArgumentNullException(nameof(operand));
+        _operands = new[] { operand };
     }
 
     public override LlvmType Type => Operand.Type;
-    public override IEnumerable<Value> Operands { get { yield return Operand; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class FreezeInstruction : Instruction
 {
     public Value Operand { get; }
+    private readonly Value[] _operands;
     public FreezeInstruction(Value operand)
     {
         Operand = operand ?? throw new ArgumentNullException(nameof(operand));
+        _operands = new[] { operand };
     }
     public override LlvmType Type => Operand.Type;
-    public override IEnumerable<Value> Operands { get { yield return Operand; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class VaArgInstruction : Instruction
@@ -661,14 +734,16 @@ public sealed class VaArgInstruction : Instruction
     public Value Valist => ValistType;
     public LlvmType ListType { get; }
 
+    private readonly Value[] _operands;
     public VaArgInstruction(LlvmType listType, Value valist, LlvmType resultType)
     {
         ListType = listType ?? throw new ArgumentNullException(nameof(listType));
         ValistType = valist ?? throw new ArgumentNullException(nameof(valist));
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { valist };
     }
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands { get { yield return ValistType; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class ExtractValueInstruction : Instruction
@@ -677,14 +752,16 @@ public sealed class ExtractValueInstruction : Instruction
     public Value Aggregate { get; }
     public IReadOnlyList<uint> Indices { get; }
 
+    private readonly Value[] _operands;
     public ExtractValueInstruction(Value aggregate, IReadOnlyList<uint> indices, LlvmType resultType)
     {
         Aggregate = aggregate ?? throw new ArgumentNullException(nameof(aggregate));
         Indices = indices ?? throw new ArgumentNullException(nameof(indices));
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
+        _operands = new[] { aggregate };
     }
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands { get { yield return Aggregate; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class InsertValueInstruction : Instruction
@@ -692,14 +769,16 @@ public sealed class InsertValueInstruction : Instruction
     public Value Aggregate { get; }
     public Value Element { get; }
     public IReadOnlyList<uint> Indices { get; }
+    private readonly Value[] _operands;
     public InsertValueInstruction(Value aggregate, Value element, IReadOnlyList<uint> indices)
     {
         Aggregate = aggregate ?? throw new ArgumentNullException(nameof(aggregate));
         Element = element ?? throw new ArgumentNullException(nameof(element));
         Indices = indices ?? throw new ArgumentNullException(nameof(indices));
+        _operands = new[] { aggregate, element };
     }
     public override LlvmType Type => Aggregate.Type;
-    public override IEnumerable<Value> Operands { get { yield return Aggregate; yield return Element; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 /// <summary>
@@ -721,6 +800,9 @@ public sealed class InvokeInstruction : Instruction
     public AttributeSet GetParameterAttributes(int index) => _paramAttrs[index];
 
     public List<OperandBundle> Bundles { get; } = new();
+
+    private Value[]? _operandsCache;
+    private int _operandsCacheBundleStamp = -1;
 
     public InvokeInstruction(FunctionType functionType, Value callee, IReadOnlyList<Value> arguments,
         BasicBlock normalDest, BasicBlock unwindDest)
@@ -766,13 +848,28 @@ public sealed class InvokeInstruction : Instruction
     };
 
     public override LlvmType Type => FunctionType.ReturnType;
-    public override IEnumerable<Value> Operands
+    public override ReadOnlySpan<Value> Operands
     {
         get
         {
-            yield return Callee;
-            foreach (var a in Arguments) yield return a;
-            foreach (var b in Bundles) foreach (var v in b.Inputs) yield return v;
+            int stamp = Bundles.Count;
+            if (_operandsCache is null || _operandsCacheBundleStamp != stamp)
+            {
+                int total = 1 + Arguments.Count;
+                for (int i = 0; i < Bundles.Count; i++) total += Bundles[i].Inputs.Count;
+                var arr = new Value[total];
+                int idx = 0;
+                arr[idx++] = Callee;
+                for (int i = 0; i < Arguments.Count; i++) arr[idx++] = Arguments[i];
+                for (int i = 0; i < Bundles.Count; i++)
+                {
+                    var inputs = Bundles[i].Inputs;
+                    for (int j = 0; j < inputs.Count; j++) arr[idx++] = inputs[j];
+                }
+                _operandsCache = arr;
+                _operandsCacheBundleStamp = stamp;
+            }
+            return _operandsCache;
         }
     }
 }
@@ -781,13 +878,15 @@ public sealed class ResumeInstruction : Instruction
 {
     private readonly LlvmType _voidType;
     public Value Value { get; }
+    private readonly Value[] _operands;
     public ResumeInstruction(LlvmType voidType, Value value)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         Value = value ?? throw new ArgumentNullException(nameof(value));
+        _operands = new[] { value };
     }
     public override LlvmType Type => _voidType;
-    public override IEnumerable<IR.Value> Operands { get { yield return Value; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 /// <summary>Landing pad clause kind: a catch handler or a filter list.</summary>
@@ -812,14 +911,28 @@ public sealed class LandingpadInstruction : Instruction
     public bool IsCleanup { get; set; }
     public List<LandingpadClause> Clauses { get; } = new();
 
+    private Value[]? _operandsCache;
+    private int _operandsCacheStamp = -1;
+
     public LandingpadInstruction(LlvmType resultType)
     {
         _resultType = resultType ?? throw new ArgumentNullException(nameof(resultType));
     }
     public override LlvmType Type => _resultType;
-    public override IEnumerable<Value> Operands
+    public override ReadOnlySpan<Value> Operands
     {
-        get { foreach (var c in Clauses) yield return c.Operand; }
+        get
+        {
+            int stamp = Clauses.Count;
+            if (_operandsCache is null || _operandsCacheStamp != stamp)
+            {
+                var arr = new Value[Clauses.Count];
+                for (int i = 0; i < Clauses.Count; i++) arr[i] = Clauses[i].Operand;
+                _operandsCache = arr;
+                _operandsCacheStamp = stamp;
+            }
+            return _operandsCache;
+        }
     }
 }
 
@@ -834,6 +947,8 @@ public sealed class CallBrInstruction : Instruction
     public IReadOnlyList<BasicBlock> IndirectDests { get; }
     public uint CallingConv { get; set; }
 
+    private readonly Value[] _operands;
+
     public CallBrInstruction(FunctionType ft, Value callee, IReadOnlyList<Value> args,
         BasicBlock defaultDest, IReadOnlyList<BasicBlock> indirectDests)
     {
@@ -842,13 +957,14 @@ public sealed class CallBrInstruction : Instruction
         Arguments = args ?? Array.Empty<Value>();
         DefaultDest = defaultDest ?? throw new ArgumentNullException(nameof(defaultDest));
         IndirectDests = indirectDests ?? Array.Empty<BasicBlock>();
+        var arr = new Value[1 + Arguments.Count];
+        arr[0] = callee;
+        for (int i = 0; i < Arguments.Count; i++) arr[i + 1] = Arguments[i];
+        _operands = arr;
     }
 
     public override LlvmType Type => FunctionType.ReturnType;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return Callee; foreach (var a in Arguments) yield return a; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 /// <summary>catchswitch — dispatches to one of the catchpad handlers based on the unwound exception.
@@ -860,16 +976,15 @@ public sealed class CatchSwitchInstruction : Instruction
     public List<BasicBlock> Handlers { get; } = new();
     public BasicBlock? UnwindDest { get; set; }   // null => unwind to caller
 
+    private readonly Value[] _operands;
     public CatchSwitchInstruction(TokenType tokenType, Value? parentPad)
     {
         _tokenType = tokenType ?? throw new ArgumentNullException(nameof(tokenType));
         ParentPad = parentPad;
+        _operands = parentPad is null ? Array.Empty<Value>() : new[] { parentPad };
     }
     public override LlvmType Type => _tokenType;
-    public override IEnumerable<Value> Operands
-    {
-        get { if (ParentPad is not null) yield return ParentPad; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CatchPadInstruction : Instruction
@@ -877,17 +992,19 @@ public sealed class CatchPadInstruction : Instruction
     private readonly TokenType _tokenType;
     public Value CatchSwitch { get; }
     public IReadOnlyList<Value> Args { get; }
+    private readonly Value[] _operands;
     public CatchPadInstruction(TokenType tokenType, Value catchSwitch, IReadOnlyList<Value> args)
     {
         _tokenType = tokenType ?? throw new ArgumentNullException(nameof(tokenType));
         CatchSwitch = catchSwitch ?? throw new ArgumentNullException(nameof(catchSwitch));
         Args = args ?? Array.Empty<Value>();
+        var arr = new Value[1 + Args.Count];
+        arr[0] = catchSwitch;
+        for (int i = 0; i < Args.Count; i++) arr[i + 1] = Args[i];
+        _operands = arr;
     }
     public override LlvmType Type => _tokenType;
-    public override IEnumerable<Value> Operands
-    {
-        get { yield return CatchSwitch; foreach (var a in Args) yield return a; }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CleanupPadInstruction : Instruction
@@ -895,21 +1012,21 @@ public sealed class CleanupPadInstruction : Instruction
     private readonly TokenType _tokenType;
     public Value? ParentPad { get; }
     public IReadOnlyList<Value> Args { get; }
+    private readonly Value[] _operands;
     public CleanupPadInstruction(TokenType tokenType, Value? parentPad, IReadOnlyList<Value> args)
     {
         _tokenType = tokenType ?? throw new ArgumentNullException(nameof(tokenType));
         ParentPad = parentPad;
         Args = args ?? Array.Empty<Value>();
+        int n = (parentPad is null ? 0 : 1) + Args.Count;
+        var arr = new Value[n];
+        int idx = 0;
+        if (parentPad is not null) arr[idx++] = parentPad;
+        for (int i = 0; i < Args.Count; i++) arr[idx++] = Args[i];
+        _operands = arr;
     }
     public override LlvmType Type => _tokenType;
-    public override IEnumerable<Value> Operands
-    {
-        get
-        {
-            if (ParentPad is not null) yield return ParentPad;
-            foreach (var a in Args) yield return a;
-        }
-    }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CatchRetInstruction : Instruction
@@ -917,14 +1034,16 @@ public sealed class CatchRetInstruction : Instruction
     private readonly LlvmType _voidType;
     public Value CatchPad { get; }
     public BasicBlock SuccessorBlock { get; }
+    private readonly Value[] _operands;
     public CatchRetInstruction(LlvmType voidType, Value catchPad, BasicBlock successor)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         CatchPad = catchPad ?? throw new ArgumentNullException(nameof(catchPad));
         SuccessorBlock = successor ?? throw new ArgumentNullException(nameof(successor));
+        _operands = new[] { catchPad };
     }
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands { get { yield return CatchPad; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }
 
 public sealed class CleanupRetInstruction : Instruction
@@ -933,12 +1052,14 @@ public sealed class CleanupRetInstruction : Instruction
     public Value CleanupPad { get; }
     /// <summary>null => unwind to caller</summary>
     public BasicBlock? UnwindDest { get; }
+    private readonly Value[] _operands;
     public CleanupRetInstruction(LlvmType voidType, Value cleanupPad, BasicBlock? unwindDest)
     {
         _voidType = voidType ?? throw new ArgumentNullException(nameof(voidType));
         CleanupPad = cleanupPad ?? throw new ArgumentNullException(nameof(cleanupPad));
         UnwindDest = unwindDest;
+        _operands = new[] { cleanupPad };
     }
     public override LlvmType Type => _voidType;
-    public override IEnumerable<Value> Operands { get { yield return CleanupPad; } }
+    public override ReadOnlySpan<Value> Operands => _operands;
 }

@@ -2,9 +2,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-permissions:
-  id-token: write
-  contents: read
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -14,9 +11,5 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - uses: NuGet/login@v1
-        id: login
-        with:
-          user: tnayuki
       - run: dotnet pack src/Bitsmith.Llvm/Bitsmith.Llvm.csproj -c Release -o out
-      - run: dotnet nuget push "out/*.nupkg" -k ${{ steps.login.outputs.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json --skip-duplicate
+      - run: dotnet nuget push "out/*.nupkg" -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json --skip-duplicate

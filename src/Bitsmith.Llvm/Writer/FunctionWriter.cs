@@ -9,6 +9,7 @@ namespace Bitsmith.Llvm.Writer;
 internal sealed class FunctionWriter
 {
     private const int FunctionAbbrevWidth = 4;
+    private const int StackOpsBudget = 64;
 
     private readonly BitstreamWriter _w;
     private readonly ValueEnumerator _ve;
@@ -18,6 +19,15 @@ internal sealed class FunctionWriter
     private readonly MetadataEnumerator? _me;
     private readonly MetadataWriter? _mw;
     private Dictionary<BasicBlock, int> _bbIds = new();
+
+    private ref struct OpsWriter
+    {
+        private readonly Span<ulong> _buf;
+        public int Count;
+        public OpsWriter(Span<ulong> buf) { _buf = buf; Count = 0; }
+        public void Add(ulong v) => _buf[Count++] = v;
+        public ReadOnlySpan<ulong> Span => _buf.Slice(0, Count);
+    }
 
     public FunctionWriter(BitstreamWriter w, ValueEnumerator ve, TypeContext types,
         IReadOnlyDictionary<Instruction, uint>? callAttrIds = null,
@@ -43,13 +53,16 @@ internal sealed class FunctionWriter
     private void WriteOperandBundles(IReadOnlyList<OperandBundle> bundles, int instId)
     {
         if (_bundleTagIds is null || bundles.Count == 0) return;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
         foreach (var b in bundles)
         {
-            var ops = new List<ulong>(1 + b.Inputs.Count * 2);
+            int n = 1 + b.Inputs.Count * 2;
+            Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+            var ops = new OpsWriter(buf);
             ops.Add(_bundleTagIds[b.Tag]);
-            foreach (var v in b.Inputs)
-                PushValueAndType(v, instId, ops);
-            _w.WriteUnabbrevRecord(FunctionCodes.OperandBundle, ops.ToArray());
+            for (int i = 0; i < b.Inputs.Count; i++)
+                PushValueAndType(b.Inputs[i], instId, ref ops);
+            _w.WriteUnabbrevRecord(FunctionCodes.OperandBundle, ops.Span);
         }
     }
 
@@ -60,30 +73,21 @@ internal sealed class FunctionWriter
 
         try
         {
-            // Block-local abbrevs for the most frequent function-block records.
-            //   declareBlocksAbbrev: [Literal(DeclareBlocks), Vbr(6) numblocks]
-            //   retVoidAbbrev:       [Literal(InstRet)]
-            //   retValAbbrev:        [Literal(InstRet), Vbr(6) opval]
-            //   binOpAbbrev:         [Literal(InstBinOp), Vbr(6) left, Vbr(6) right, Vbr(4) opcode]
             _declareBlocksAbbrev = _w.DefineAbbrev(AbbrevOp.Literal(FunctionCodes.DeclareBlocks), AbbrevOp.Vbr(6));
             _retVoidAbbrev = _w.DefineAbbrev(AbbrevOp.Literal(FunctionCodes.InstRet));
             _retValAbbrev = _w.DefineAbbrev(AbbrevOp.Literal(FunctionCodes.InstRet), AbbrevOp.Vbr(6));
             _binOpAbbrev = _w.DefineAbbrev(
                 AbbrevOp.Literal(FunctionCodes.InstBinOp),
                 AbbrevOp.Vbr(6), AbbrevOp.Vbr(6), AbbrevOp.Vbr(4));
-            // [Literal(InstLoad), Vbr(6) ptrRel, Vbr(6) tyId, Fixed(7) align, Fixed(1) vol]
             _loadAbbrev = _w.DefineAbbrev(
                 AbbrevOp.Literal(FunctionCodes.InstLoad),
                 AbbrevOp.Vbr(6), AbbrevOp.Vbr(6), AbbrevOp.Fixed(7), AbbrevOp.Fixed(1));
-            // [Literal(InstStore), Vbr(6) ptrRel, Vbr(6) valRel, Fixed(7) align, Fixed(1) vol]
             _storeAbbrev = _w.DefineAbbrev(
                 AbbrevOp.Literal(FunctionCodes.InstStore),
                 AbbrevOp.Vbr(6), AbbrevOp.Vbr(6), AbbrevOp.Fixed(7), AbbrevOp.Fixed(1));
-            // [Literal(InstCmp2), Vbr(6) leftRel, Vbr(6) rightRel, Vbr(6) predicate]
             _cmpAbbrev = _w.DefineAbbrev(
                 AbbrevOp.Literal(FunctionCodes.InstCmp2),
                 AbbrevOp.Vbr(6), AbbrevOp.Vbr(6), AbbrevOp.Vbr(6));
-            // [Literal(InstCast), Vbr(6) opRel, Vbr(6) destTyId, Fixed(4) opcode]
             _castAbbrev = _w.DefineAbbrev(
                 AbbrevOp.Literal(FunctionCodes.InstCast),
                 AbbrevOp.Vbr(6), AbbrevOp.Vbr(6), AbbrevOp.Fixed(4));
@@ -94,16 +98,10 @@ internal sealed class FunctionWriter
             for (int i = 0; i < fn.BasicBlocks.Count; i++)
                 _bbIds[fn.BasicBlocks[i]] = i;
 
-            // Function-local CONSTANTS_BLOCK — operand-side constants discovered by
-            // ValueEnumerator. Instructions reference these via their assigned IDs.
             ConstantWriter.WriteModuleConstants(_w, _ve.FunctionConstants, _ve.GetValueId);
 
-            // Function-local METADATA_BLOCK — MdValue/DiArgList referencing args
-            // or instructions of this function. IDs continue from ModuleMetadataCount.
             EmitFunctionLocalMetadata(fn);
 
-            // InstID starts at NumModuleValues + NumArgs + NumLocalConsts.
-            // It increments only for instructions whose type is not void.
             int instId = _ve.ModuleValueCount + fn.Parameters.Count + _ve.FunctionConstants.Count;
 
             DiLocation? prevLoc = null;
@@ -141,8 +139,7 @@ internal sealed class FunctionWriter
 
     /// <summary>
     /// Emits a function-local VALUE_SYMTAB_BLOCK with names for any named basic blocks
-    /// or named (non-void) instructions. The reader uses these to reconstruct
-    /// <c>%entry:</c>, <c>%result = ...</c> etc. in the disassembly.
+    /// or named (non-void) instructions.
     /// </summary>
     private void WriteFunctionValueSymtab(Function fn)
     {
@@ -162,11 +159,7 @@ internal sealed class FunctionWriter
         {
             var bb = fn.BasicBlocks[bi];
             if (string.IsNullOrEmpty(bb.Name)) continue;
-            var bytes = System.Text.Encoding.UTF8.GetBytes(bb.Name!);
-            var ops = new ulong[1 + bytes.Length];
-            ops[0] = (ulong)bi;
-            for (int i = 0; i < bytes.Length; i++) ops[1 + i] = bytes[i];
-            _w.WriteUnabbrevRecord(2 /* VST_CODE_BBENTRY */, ops);
+            EmitNameRecord(2 /* VST_CODE_BBENTRY */, (ulong)bi, bb.Name!);
         }
 
         foreach (var bb in fn.BasicBlocks)
@@ -175,15 +168,25 @@ internal sealed class FunctionWriter
             {
                 if (string.IsNullOrEmpty(inst.Name) || inst.Type is VoidType) continue;
                 int valId = _ve.GetValueId(inst);
-                var bytes = System.Text.Encoding.UTF8.GetBytes(inst.Name!);
-                var ops = new ulong[1 + bytes.Length];
-                ops[0] = (ulong)valId;
-                for (int i = 0; i < bytes.Length; i++) ops[1 + i] = bytes[i];
-                _w.WriteUnabbrevRecord(1 /* VST_CODE_ENTRY */, ops);
+                EmitNameRecord(1 /* VST_CODE_ENTRY */, (ulong)valId, inst.Name!);
             }
         }
 
         _w.ExitBlock();
+    }
+
+    private void EmitNameRecord(uint code, ulong idOp, string name)
+    {
+        int byteCount = System.Text.Encoding.UTF8.GetByteCount(name);
+        Span<byte> bytesStack = stackalloc byte[256];
+        Span<byte> bytes = byteCount <= 256 ? bytesStack : new byte[byteCount];
+        int written = System.Text.Encoding.UTF8.GetBytes(name, bytes);
+        Span<ulong> opsStack = stackalloc ulong[StackOpsBudget];
+        int n = 1 + written;
+        Span<ulong> ops = n <= StackOpsBudget ? opsStack.Slice(0, n) : new ulong[n];
+        ops[0] = idOp;
+        for (int i = 0; i < written; i++) ops[1 + i] = bytes[i];
+        _w.WriteUnabbrevRecord(code, ops);
     }
 
     private void EmitDebugLoc(DiLocation? loc, ref DiLocation? prev)
@@ -195,12 +198,13 @@ internal sealed class FunctionWriter
             _w.WriteUnabbrevRecord(DebugLocCodes.DebugLocAgain);
             return;
         }
-        _w.WriteUnabbrevRecord(DebugLocCodes.DebugLoc,
-            loc.Line,
-            loc.Column,
-            (ulong)_me.GetIdRequired(loc.Scope),
-            (ulong)_me.GetIdOrNull(loc.InlinedAt),
-            loc.IsImplicitCode ? 1UL : 0UL);
+        Span<ulong> ops = stackalloc ulong[5];
+        ops[0] = loc.Line;
+        ops[1] = loc.Column;
+        ops[2] = (ulong)_me.GetIdRequired(loc.Scope);
+        ops[3] = (ulong)_me.GetIdOrNull(loc.InlinedAt);
+        ops[4] = loc.IsImplicitCode ? 1UL : 0UL;
+        _w.WriteUnabbrevRecord(DebugLocCodes.DebugLoc, ops);
         prev = loc;
     }
 
@@ -225,19 +229,19 @@ internal sealed class FunctionWriter
     private void WriteFunctionAttachments(Function fn)
     {
         _w.EnterSubBlock(BlockIds.MetadataAttachment, 3);
-        // METADATA_ATTACHMENT operand IDs are 0-based — distinct from the 1-based
-        // encoding used by getMetadataOrNullID elsewhere.
         if (fn.Subprogram is not null)
         {
-            _w.WriteUnabbrevRecord(MetadataCodes.Attachment,
-                MetadataWriter.DbgKind,
-                (ulong)fn.Subprogram.Id);
+            Span<ulong> ops = stackalloc ulong[2];
+            ops[0] = MetadataWriter.DbgKind;
+            ops[1] = (ulong)fn.Subprogram.Id;
+            _w.WriteUnabbrevRecord(MetadataCodes.Attachment, ops);
         }
 
         // Per-instruction attachments (non-dbg). instIndex is a flat 0-based
         // index over all instructions in BB iteration order; matches
         // BitcodeWriter::writeMetadataAttachment in LLVM. Record layout:
         //   [instIndex, kind_id, md_id, kind_id, md_id, ...]
+        Span<ulong> opsStack = stackalloc ulong[StackOpsBudget];
         int instIndex = 0;
         foreach (var bb in fn.BasicBlocks)
         {
@@ -246,7 +250,8 @@ internal sealed class FunctionWriter
                 var atts = inst.Attachments;
                 if (atts is { Count: > 0 } && _mw is not null)
                 {
-                    var ops = new ulong[1 + atts.Count * 2];
+                    int n = 1 + atts.Count * 2;
+                    Span<ulong> ops = n <= StackOpsBudget ? opsStack.Slice(0, n) : new ulong[n];
                     ops[0] = (ulong)instIndex;
                     int o = 1;
                     foreach (var (kindName, md) in atts)
@@ -307,67 +312,73 @@ internal sealed class FunctionWriter
 
     private void WriteUnaryOp(UnaryOperator u, int instId)
     {
-        // [opval+ty, opcode, (flags?)]
-        var ops = new List<ulong>(4);
-        PushValueAndType(u.Operand, instId, ops);
+        Span<ulong> buf = stackalloc ulong[4];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(u.Operand, instId, ref ops);
         ops.Add((ulong)u.Opcode);
         if (u.Fmf != FastMathFlags.None) ops.Add((ulong)u.Fmf);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstUnOp, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstUnOp, ops.Span);
     }
 
     private void WriteFreeze(FreezeInstruction fz, int instId)
     {
-        var ops = new List<ulong>(2);
-        PushValueAndType(fz.Operand, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstFreeze, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[2];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(fz.Operand, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstFreeze, ops.Span);
     }
 
     private void WriteVaArg(VaArgInstruction va, int instId)
     {
-        // [valisttype, valist, resulttype]
-        var ops = new List<ulong>(3)
-        {
-            (ulong)va.ListType.Id,
-            (ulong)(uint)(instId - _ve.GetValueId(va.ValistType)),
-            (ulong)va.Type.Id,
-        };
-        _w.WriteUnabbrevRecord(FunctionCodes.InstVaArg, ops.ToArray());
+        Span<ulong> ops = stackalloc ulong[3];
+        ops[0] = (ulong)va.ListType.Id;
+        ops[1] = (ulong)(uint)(instId - _ve.GetValueId(va.ValistType));
+        ops[2] = (ulong)va.Type.Id;
+        _w.WriteUnabbrevRecord(FunctionCodes.InstVaArg, ops);
     }
 
     private void WriteExtractValue(ExtractValueInstruction ev, int instId)
     {
-        // [opval+ty, n x indices]
-        var ops = new List<ulong>(2 + ev.Indices.Count);
-        PushValueAndType(ev.Aggregate, instId, ops);
-        foreach (var i in ev.Indices) ops.Add(i);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstExtractVal, ops.ToArray());
+        int n = 2 + ev.Indices.Count;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(ev.Aggregate, instId, ref ops);
+        for (int i = 0; i < ev.Indices.Count; i++) ops.Add(ev.Indices[i]);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstExtractVal, ops.Span);
     }
 
     private void WriteInsertValue(InsertValueInstruction iv, int instId)
     {
-        // [aggval+ty, eltval+ty, n x indices]
-        var ops = new List<ulong>(4 + iv.Indices.Count);
-        PushValueAndType(iv.Aggregate, instId, ops);
-        PushValueAndType(iv.Element, instId, ops);
-        foreach (var i in iv.Indices) ops.Add(i);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstInsertVal, ops.ToArray());
+        int n = 4 + iv.Indices.Count;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(iv.Aggregate, instId, ref ops);
+        PushValueAndType(iv.Element, instId, ref ops);
+        for (int i = 0; i < iv.Indices.Count; i++) ops.Add(iv.Indices[i]);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstInsertVal, ops.Span);
     }
 
     private void WriteInvoke(InvokeInstruction inv, int instId)
     {
         WriteOperandBundles(inv.Bundles, instId);
-        // [paramattrs, callFlags, normalBB, unwindBB, FTy, callee+ty, args...]
-        // callFlags: bits 0..12 calling conv, bit 13 reserved (unused), bit 14 = explicit FT.
         ulong flags = ((ulong)(inv.CallingConv & 0x1FFF))
                       | (1UL << 13);  // ExplicitType bit (LLVM 15 invoke encoding)
         int fixedParamCount = inv.FunctionType.ParameterTypes.Count;
-        var ops = new List<ulong>(6 + 2 + fixedParamCount + (inv.Arguments.Count - fixedParamCount) * 2);
+        // Worst-case sizing: callee may need 2 ops (forward ref + type),
+        // each fixed arg always 1 op (LLVM 15 spec — see comment below),
+        // each vararg 2 ops.
+        int n = 6 + 2 + fixedParamCount + (inv.Arguments.Count - fixedParamCount) * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add(GetCallAttrId(inv));
         ops.Add(flags);
         ops.Add((ulong)BbId(inv.NormalDest));
         ops.Add((ulong)BbId(inv.UnwindDest));
         ops.Add((ulong)inv.FunctionType.Id);
-        PushValueAndType(inv.Callee, instId, ops);
+        PushValueAndType(inv.Callee, instId, ref ops);
 
         // LLVM 15 INVOKE / CALL writers emit *fixed* parameters with
         // pushValue() (1 op per arg; type derived from the FunctionType
@@ -379,133 +390,145 @@ internal sealed class FunctionWriter
         // args was a forward reference (since that would have written 2
         // ops while the reader consumes only 1). Mirror the spec exactly.
         for (int i = 0; i < fixedParamCount && i < inv.Arguments.Count; i++)
-            PushValue(inv.Arguments[i], instId, ops);
+            PushValue(inv.Arguments[i], instId, ref ops);
         if (inv.FunctionType.IsVarArg)
         {
             for (int i = fixedParamCount; i < inv.Arguments.Count; i++)
-                PushValueAndType(inv.Arguments[i], instId, ops);
+                PushValueAndType(inv.Arguments[i], instId, ref ops);
         }
 
-        _w.WriteUnabbrevRecord(FunctionCodes.InstInvoke, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstInvoke, ops.Span);
     }
 
     private void WriteResume(ResumeInstruction res, int instId)
     {
-        var ops = new List<ulong>(2);
-        PushValueAndType(res.Value, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstResume, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[2];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(res.Value, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstResume, ops.Span);
     }
 
     private void WriteLandingpad(LandingpadInstruction lp, int instId)
     {
-        // [resty, cleanup, num_clauses, kind+typeId+value...]
-        var ops = new List<ulong>(4 + lp.Clauses.Count * 3);
+        int n = 4 + lp.Clauses.Count * 3;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)lp.Type.Id);
         ops.Add(lp.IsCleanup ? 1UL : 0UL);
         ops.Add((ulong)lp.Clauses.Count);
-        foreach (var c in lp.Clauses)
+        for (int i = 0; i < lp.Clauses.Count; i++)
         {
+            var c = lp.Clauses[i];
             ops.Add((uint)c.Kind);
-            PushValueAndType(c.Operand, instId, ops);
+            PushValueAndType(c.Operand, instId, ref ops);
         }
-        _w.WriteUnabbrevRecord(FunctionCodes.InstLandingpad, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstLandingpad, ops.Span);
     }
 
     private void WriteCallBr(CallBrInstruction cb, int instId)
     {
-        // [paramattrs, callFlags, defaultBB, num_indirect, indirect_bb..., FTy, callee+ty, args...]
         ulong flags = ((ulong)(cb.CallingConv & 0x1FFF));
-        var ops = new List<ulong>(8 + cb.IndirectDests.Count + cb.Arguments.Count * 2);
+        int n = 8 + cb.IndirectDests.Count + cb.Arguments.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add(0UL);
         ops.Add(flags);
         ops.Add((ulong)BbId(cb.DefaultDest));
         ops.Add((ulong)cb.IndirectDests.Count);
-        foreach (var d in cb.IndirectDests) ops.Add((ulong)BbId(d));
+        for (int i = 0; i < cb.IndirectDests.Count; i++) ops.Add((ulong)BbId(cb.IndirectDests[i]));
         ops.Add((ulong)cb.FunctionType.Id);
-        PushValueAndType(cb.Callee, instId, ops);
-        foreach (var a in cb.Arguments)
-            PushValueAndType(a, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCallBr, ops.ToArray());
+        PushValueAndType(cb.Callee, instId, ref ops);
+        for (int i = 0; i < cb.Arguments.Count; i++)
+            PushValueAndType(cb.Arguments[i], instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCallBr, ops.Span);
     }
 
     private void WriteCatchSwitch(CatchSwitchInstruction cs, int instId)
     {
-        // [parent, num_handlers, handlers..., (unwind_dest|unwind_to_caller)]
-        var ops = new List<ulong>(3 + cs.Handlers.Count);
+        int n = 3 + cs.Handlers.Count;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         if (cs.ParentPad is null) ops.Add(0UL);
-        else PushValue(cs.ParentPad, instId, ops);
+        else PushValue(cs.ParentPad, instId, ref ops);
         ops.Add((ulong)cs.Handlers.Count);
-        foreach (var h in cs.Handlers) ops.Add((ulong)BbId(h));
+        for (int i = 0; i < cs.Handlers.Count; i++) ops.Add((ulong)BbId(cs.Handlers[i]));
         if (cs.UnwindDest is not null) ops.Add((ulong)BbId(cs.UnwindDest));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchSwitch, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchSwitch, ops.Span);
     }
 
     private void WriteCatchPad(CatchPadInstruction cp, int instId)
     {
-        var ops = new List<ulong>(2 + cp.Args.Count * 2);
-        PushValue(cp.CatchSwitch, instId, ops);
+        int n = 2 + cp.Args.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
+        PushValue(cp.CatchSwitch, instId, ref ops);
         ops.Add((ulong)cp.Args.Count);
-        foreach (var a in cp.Args) PushValueAndType(a, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchPad, ops.ToArray());
+        for (int i = 0; i < cp.Args.Count; i++) PushValueAndType(cp.Args[i], instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchPad, ops.Span);
     }
 
     private void WriteCleanupPad(CleanupPadInstruction clp, int instId)
     {
-        // [num_args, parent_or_none, args...]
-        var ops = new List<ulong>(2 + clp.Args.Count * 2);
+        int n = 2 + clp.Args.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)clp.Args.Count);
         if (clp.ParentPad is null) ops.Add(0UL);
-        else PushValue(clp.ParentPad, instId, ops);
-        foreach (var a in clp.Args) PushValueAndType(a, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCleanupPad, ops.ToArray());
+        else PushValue(clp.ParentPad, instId, ref ops);
+        for (int i = 0; i < clp.Args.Count; i++) PushValueAndType(clp.Args[i], instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCleanupPad, ops.Span);
     }
 
     private void WriteCatchRet(CatchRetInstruction cr, int instId)
     {
-        var ops = new List<ulong>(2);
-        PushValue(cr.CatchPad, instId, ops);
+        Span<ulong> buf = stackalloc ulong[2];
+        var ops = new OpsWriter(buf);
+        PushValue(cr.CatchPad, instId, ref ops);
         ops.Add((ulong)BbId(cr.SuccessorBlock));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchRet, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCatchRet, ops.Span);
     }
 
     private void WriteCleanupRet(CleanupRetInstruction clr, int instId)
     {
-        var ops = new List<ulong>(2);
-        PushValue(clr.CleanupPad, instId, ops);
+        Span<ulong> buf = stackalloc ulong[2];
+        var ops = new OpsWriter(buf);
+        PushValue(clr.CleanupPad, instId, ref ops);
         if (clr.UnwindDest is not null) ops.Add((ulong)BbId(clr.UnwindDest));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCleanupRet, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCleanupRet, ops.Span);
     }
 
     private void WriteBinaryOp(BinaryOperator b, int instId)
     {
-        // [opval, (ty?), opval, opcode, (flags?)]
         ulong flags = EncodeBinaryOpFlags(b);
         int leftId = _ve.GetValueId(b.Left);
         bool leftForward = leftId >= instId;
 
-        // Fast path: no flags, no forward-ref → 3-op abbrev.
         if (!leftForward && flags == 0)
         {
-            _w.WriteAbbrevRecord(_binOpAbbrev,
-                (ulong)(uint)(instId - leftId),
-                (ulong)(uint)(instId - _ve.GetValueId(b.Right)),
-                (ulong)b.Opcode);
+            Span<ulong> abbrev = stackalloc ulong[3];
+            abbrev[0] = (ulong)(uint)(instId - leftId);
+            abbrev[1] = (ulong)(uint)(instId - _ve.GetValueId(b.Right));
+            abbrev[2] = (ulong)b.Opcode;
+            _w.WriteAbbrevRecord(_binOpAbbrev, abbrev);
             return;
         }
 
-        var ops = new List<ulong>(5);
-        PushValueAndType(b.Left, instId, ops);
-        PushValue(b.Right, instId, ops);
+        Span<ulong> buf = stackalloc ulong[5];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(b.Left, instId, ref ops);
+        PushValue(b.Right, instId, ref ops);
         ops.Add((ulong)b.Opcode);
         if (flags != 0) ops.Add(flags);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstBinOp, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstBinOp, ops.Span);
     }
 
     /// <summary>
-    /// Reproduces <c>BitcodeWriter::getOptimizationFlags</c>. Bit positions:
-    ///   OBO ops (Add/Sub/Mul/Shl, integer): nuw=bit0, nsw=bit1
-    ///   PEO ops (UDiv/SDiv/LShr/AShr, integer): exact=bit0
-    ///   FP ops: <see cref="FastMathFlags"/> raw bits
+    /// Reproduces <c>BitcodeWriter::getOptimizationFlags</c>.
     /// </summary>
     private static ulong EncodeBinaryOpFlags(BinaryOperator b)
     {
@@ -552,13 +575,13 @@ internal sealed class FunctionWriter
         int valId = _ve.GetValueId(r.ReturnValue);
         if (valId < instId)
         {
-            // Backward reference — single-op abbrev path.
             _w.WriteAbbrevRecord(_retValAbbrev, (ulong)(uint)(instId - valId));
             return;
         }
-        var ops = new List<ulong>(2);
-        PushValueAndType(r.ReturnValue, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstRet, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[2];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(r.ReturnValue, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstRet, ops.Span);
     }
 
     private void WriteBr(BranchInstruction br, int instId)
@@ -568,46 +591,46 @@ internal sealed class FunctionWriter
             _w.WriteUnabbrevRecord(FunctionCodes.InstBr, (ulong)BbId(br.TrueTarget));
             return;
         }
-        var ops = new List<ulong>(3);
+        Span<ulong> buf = stackalloc ulong[3];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)BbId(br.TrueTarget));
         ops.Add((ulong)BbId(br.FalseTarget!));
-        PushValue(br.Condition!, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstBr, ops.ToArray());
+        PushValue(br.Condition!, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstBr, ops.Span);
     }
 
     private void WriteIndirectBr(IndirectBrInstruction ibr, int instId)
     {
-        // [ptrTypeId, addrRel, bb1Idx, bb2Idx, ...]
-        var ops = new List<ulong>(2 + ibr.PossibleTargets.Count);
+        int n = 2 + ibr.PossibleTargets.Count;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)ibr.Address.Type.Id);
-        PushValue(ibr.Address, instId, ops);
-        foreach (var bb in ibr.PossibleTargets) ops.Add((ulong)BbId(bb));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstIndirectBr, ops.ToArray());
+        PushValue(ibr.Address, instId, ref ops);
+        for (int i = 0; i < ibr.PossibleTargets.Count; i++) ops.Add((ulong)BbId(ibr.PossibleTargets[i]));
+        _w.WriteUnabbrevRecord(FunctionCodes.InstIndirectBr, ops.Span);
     }
 
     private void WriteSwitch(SwitchInstruction sw, int instId)
     {
-        var ops = new List<ulong>(4 + sw.Cases.Count * 2);
+        int n = 4 + sw.Cases.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)sw.Condition.Type.Id);
-        PushValue(sw.Condition, instId, ops);
+        PushValue(sw.Condition, instId, ref ops);
         ops.Add((ulong)BbId(sw.DefaultDest));
-        foreach (var (cv, dest) in sw.Cases)
+        for (int i = 0; i < sw.Cases.Count; i++)
         {
+            var (cv, dest) = sw.Cases[i];
             ops.Add((ulong)_ve.GetValueId(cv));
             ops.Add((ulong)BbId(dest));
         }
-        _w.WriteUnabbrevRecord(FunctionCodes.InstSwitch, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstSwitch, ops.Span);
     }
 
     private void WriteAlloca(AllocaInstruction a)
     {
-        // [instty, opty, op, alignRecord]
-        // alignRecord layout (AllocaPackedValues):
-        //   bits 0..4  AlignLower(5)
-        //   bit  5     UsedWithInAlloca
-        //   bit  6     ExplicitType    (always 1 — opaque pointers)
-        //   bit  7     SwiftError
-        //   bits 8..   AlignUpper
         uint encodedAlign = a.Alignment == 0 ? 0u : (uint)(Log2(a.Alignment) + 1);
         uint record = (encodedAlign & 0x1Fu)
                       | (a.IsInAlloca ? (1u << 5) : 0u)
@@ -619,32 +642,31 @@ internal sealed class FunctionWriter
         // (LLVM 15 writer: VE.getValueID(I.getOperand(0)); reader:
         // getFnValueByID(Record[2], OpTy, ...)). Do NOT switch this
         // to relative encoding — both reader and writer use absolute.
-        var ops = new ulong[]
-        {
-            (ulong)a.AllocatedType.Id,
-            (ulong)a.NumElements.Type.Id,
-            (ulong)_ve.GetValueId(a.NumElements),
-            record,
-        };
+        Span<ulong> ops = stackalloc ulong[4];
+        ops[0] = (ulong)a.AllocatedType.Id;
+        ops[1] = (ulong)a.NumElements.Type.Id;
+        ops[2] = (ulong)_ve.GetValueId(a.NumElements);
+        ops[3] = record;
         _w.WriteUnabbrevRecord(FunctionCodes.InstAlloca, ops);
     }
 
     private void WriteLoad(LoadInstruction l, int instId)
     {
-        // Fast path: non-atomic, backward-ref pointer → 4-op load abbrev.
         int ptrId = _ve.GetValueId(l.Pointer);
         if (!l.IsAtomic && ptrId < instId && EncodedAlign(l.Alignment) < (1u << 7))
         {
-            _w.WriteAbbrevRecord(_loadAbbrev,
-                (ulong)(uint)(instId - ptrId),
-                (ulong)l.Type.Id,
-                EncodedAlign(l.Alignment),
-                l.IsVolatile ? 1UL : 0UL);
+            Span<ulong> abbrev = stackalloc ulong[4];
+            abbrev[0] = (ulong)(uint)(instId - ptrId);
+            abbrev[1] = (ulong)l.Type.Id;
+            abbrev[2] = EncodedAlign(l.Alignment);
+            abbrev[3] = l.IsVolatile ? 1UL : 0UL;
+            _w.WriteAbbrevRecord(_loadAbbrev, abbrev);
             return;
         }
 
-        var ops = new List<ulong>(8);
-        PushValueAndType(l.Pointer, instId, ops);
+        Span<ulong> buf = stackalloc ulong[8];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(l.Pointer, instId, ref ops);
         ops.Add((ulong)l.Type.Id);
         ops.Add((ulong)EncodedAlign(l.Alignment));
         ops.Add(l.IsVolatile ? 1UL : 0UL);
@@ -652,141 +674,148 @@ internal sealed class FunctionWriter
         {
             ops.Add(l.Ordering);
             ops.Add(l.SyncScope);
-            _w.WriteUnabbrevRecord(FunctionCodes.InstLoadAtomic, ops.ToArray());
+            _w.WriteUnabbrevRecord(FunctionCodes.InstLoadAtomic, ops.Span);
         }
         else
         {
-            _w.WriteUnabbrevRecord(FunctionCodes.InstLoad, ops.ToArray());
+            _w.WriteUnabbrevRecord(FunctionCodes.InstLoad, ops.Span);
         }
     }
 
     private void WriteStore(StoreInstruction s, int instId)
     {
-        // Fast path: non-atomic, both backward-ref → 4-op store abbrev.
         int ptrId = _ve.GetValueId(s.Pointer);
         int valId = _ve.GetValueId(s.StoredValue);
         if (!s.IsAtomic && ptrId < instId && valId < instId && EncodedAlign(s.Alignment) < (1u << 7))
         {
-            _w.WriteAbbrevRecord(_storeAbbrev,
-                (ulong)(uint)(instId - ptrId),
-                (ulong)(uint)(instId - valId),
-                EncodedAlign(s.Alignment),
-                s.IsVolatile ? 1UL : 0UL);
+            Span<ulong> abbrev = stackalloc ulong[4];
+            abbrev[0] = (ulong)(uint)(instId - ptrId);
+            abbrev[1] = (ulong)(uint)(instId - valId);
+            abbrev[2] = EncodedAlign(s.Alignment);
+            abbrev[3] = s.IsVolatile ? 1UL : 0UL;
+            _w.WriteAbbrevRecord(_storeAbbrev, abbrev);
             return;
         }
 
-        var ops = new List<ulong>(8);
-        PushValueAndType(s.Pointer, instId, ops);
-        PushValueAndType(s.StoredValue, instId, ops);
+        Span<ulong> buf = stackalloc ulong[8];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(s.Pointer, instId, ref ops);
+        PushValueAndType(s.StoredValue, instId, ref ops);
         ops.Add((ulong)EncodedAlign(s.Alignment));
         ops.Add(s.IsVolatile ? 1UL : 0UL);
         if (s.IsAtomic)
         {
             ops.Add(s.Ordering);
             ops.Add(s.SyncScope);
-            _w.WriteUnabbrevRecord(FunctionCodes.InstStoreAtomic, ops.ToArray());
+            _w.WriteUnabbrevRecord(FunctionCodes.InstStoreAtomic, ops.Span);
         }
         else
         {
-            _w.WriteUnabbrevRecord(FunctionCodes.InstStore, ops.ToArray());
+            _w.WriteUnabbrevRecord(FunctionCodes.InstStore, ops.Span);
         }
     }
 
     private void WriteCast(CastInstruction c, int instId)
     {
-        // Fast path: backward-ref operand & opcode fits in 4 bits → 3-op cast abbrev.
         int opId = _ve.GetValueId(c.Operand);
         if (opId < instId && c.Opcode < (1u << 4))
         {
-            _w.WriteAbbrevRecord(_castAbbrev,
-                (ulong)(uint)(instId - opId),
-                (ulong)c.Type.Id,
-                c.Opcode);
+            Span<ulong> abbrev = stackalloc ulong[3];
+            abbrev[0] = (ulong)(uint)(instId - opId);
+            abbrev[1] = (ulong)c.Type.Id;
+            abbrev[2] = c.Opcode;
+            _w.WriteAbbrevRecord(_castAbbrev, abbrev);
             return;
         }
 
-        var ops = new List<ulong>(4);
-        PushValueAndType(c.Operand, instId, ops);
+        Span<ulong> buf = stackalloc ulong[4];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(c.Operand, instId, ref ops);
         ops.Add((ulong)c.Type.Id);
         ops.Add(c.Opcode);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCast, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCast, ops.Span);
     }
 
     private void WriteCmp(CompareInstruction cmp, int instId)
     {
-        // Fast path: backward-ref operands and no FMF → 3-op cmp abbrev.
         int leftId = _ve.GetValueId(cmp.Left);
         int rightId = _ve.GetValueId(cmp.Right);
         bool noFmf = cmp.Fmf == FastMathFlags.None || !IsFloatLike(cmp.Left.Type);
         if (leftId < instId && rightId < instId && noFmf)
         {
-            _w.WriteAbbrevRecord(_cmpAbbrev,
-                (ulong)(uint)(instId - leftId),
-                (ulong)(uint)(instId - rightId),
-                cmp.Predicate);
+            Span<ulong> abbrev = stackalloc ulong[3];
+            abbrev[0] = (ulong)(uint)(instId - leftId);
+            abbrev[1] = (ulong)(uint)(instId - rightId);
+            abbrev[2] = cmp.Predicate;
+            _w.WriteAbbrevRecord(_cmpAbbrev, abbrev);
             return;
         }
 
-        var ops = new List<ulong>(5);
-        PushValueAndType(cmp.Left, instId, ops);
-        PushValue(cmp.Right, instId, ops);
+        Span<ulong> buf = stackalloc ulong[5];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(cmp.Left, instId, ref ops);
+        PushValue(cmp.Right, instId, ref ops);
         ops.Add(cmp.Predicate);
-        // FCMP can carry FMF flags; emit only when non-zero (matches LLVM).
         if (cmp.Fmf != FastMathFlags.None && IsFloatLike(cmp.Left.Type))
             ops.Add((ulong)cmp.Fmf);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCmp2, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCmp2, ops.Span);
     }
 
     private void WriteGep(GetElementPtrInstruction g, int instId)
     {
-        var ops = new List<ulong>(4 + g.Indices.Count * 2);
+        int n = 4 + g.Indices.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add(g.IsInBounds ? 1UL : 0UL);
         ops.Add((ulong)g.SourceElementType.Id);
-        PushValueAndType(g.Pointer, instId, ops);
-        foreach (var idx in g.Indices)
-            PushValueAndType(idx, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstGep, ops.ToArray());
+        PushValueAndType(g.Pointer, instId, ref ops);
+        for (int i = 0; i < g.Indices.Count; i++)
+            PushValueAndType(g.Indices[i], instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstGep, ops.Span);
     }
 
     private void WritePhi(PhiInstruction p, int instId)
     {
-        var ops = new List<ulong>(1 + p.Incomings.Count * 2);
+        int n = 1 + p.Incomings.Count * 2;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add((ulong)p.Type.Id);
-        foreach (var (v, bb) in p.Incomings)
+        for (int i = 0; i < p.Incomings.Count; i++)
         {
+            var (v, bb) = p.Incomings[i];
             int valId = _ve.GetValueId(v);
             int diff = instId - valId;
             ops.Add(SignRotate(diff));
             ops.Add((ulong)BbId(bb));
         }
-        _w.WriteUnabbrevRecord(FunctionCodes.InstPhi, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstPhi, ops.Span);
     }
 
     private void WriteSelect(SelectInstruction sel, int instId)
     {
-        var ops = new List<ulong>(5);
+        Span<ulong> buf = stackalloc ulong[5];
+        var ops = new OpsWriter(buf);
         if (sel.Condition.Type is VectorType)
         {
-            // INST_VSELECT: [opval+ty(true), opval(false), opval+ty(cond)]
-            PushValueAndType(sel.TrueValue, instId, ops);
-            PushValue(sel.FalseValue, instId, ops);
-            PushValueAndType(sel.Condition, instId, ops);
-            _w.WriteUnabbrevRecord(FunctionCodes.InstVSelect, ops.ToArray());
+            PushValueAndType(sel.TrueValue, instId, ref ops);
+            PushValue(sel.FalseValue, instId, ref ops);
+            PushValueAndType(sel.Condition, instId, ref ops);
+            _w.WriteUnabbrevRecord(FunctionCodes.InstVSelect, ops.Span);
         }
         else
         {
-            // INST_SELECT: [opval+ty(true), opval(false), opval(cond:i1)]
-            PushValueAndType(sel.TrueValue, instId, ops);
-            PushValue(sel.FalseValue, instId, ops);
-            PushValue(sel.Condition, instId, ops);
-            _w.WriteUnabbrevRecord(FunctionCodes.InstSelect, ops.ToArray());
+            PushValueAndType(sel.TrueValue, instId, ref ops);
+            PushValue(sel.FalseValue, instId, ref ops);
+            PushValue(sel.Condition, instId, ref ops);
+            _w.WriteUnabbrevRecord(FunctionCodes.InstSelect, ops.Span);
         }
     }
 
     private void WriteCall(CallInstruction call, int instId)
     {
         WriteOperandBundles(call.Bundles, instId);
-        // [paramattrs, callFlags, FTy, callee+ty, args..., (FMF if Fmf bit set)]
         ulong flags = (1UL << CallFlags.ExplicitType)
                       | ((ulong)(call.CallingConv & 0x7FF) << CallFlags.Cconv)
                       | (call.IsTailCall ? 1UL << CallFlags.Tail : 0UL)
@@ -794,11 +823,14 @@ internal sealed class FunctionWriter
                       | (call.Fmf != FastMathFlags.None ? 1UL << CallFlags.Fmf : 0UL);
 
         int fixedParamCount = call.FunctionType.ParameterTypes.Count;
-        var ops = new List<ulong>(4 + 2 + fixedParamCount + (call.Arguments.Count - fixedParamCount) * 2 + 1);
+        int n = 4 + 2 + fixedParamCount + (call.Arguments.Count - fixedParamCount) * 2 + 1;
+        Span<ulong> stack = stackalloc ulong[StackOpsBudget];
+        Span<ulong> buf = n <= StackOpsBudget ? stack : new ulong[n];
+        var ops = new OpsWriter(buf);
         ops.Add(GetCallAttrId(call));
         ops.Add(flags);
         ops.Add((ulong)call.FunctionType.Id);
-        PushValueAndType(call.Callee, instId, ops);
+        PushValueAndType(call.Callee, instId, ref ops);
 
         // LLVM 15 CALL writer (BitcodeWriter.cpp::writeInstruction case
         // Instruction::Call) emits *fixed* parameters via pushValue() (1
@@ -810,41 +842,44 @@ internal sealed class FunctionWriter
         // generic "Invalid record" error during disassembly. Match the
         // spec exactly so forward-ref-into-call sites round-trip.
         for (int i = 0; i < fixedParamCount && i < call.Arguments.Count; i++)
-            PushValue(call.Arguments[i], instId, ops);
+            PushValue(call.Arguments[i], instId, ref ops);
         if (call.FunctionType.IsVarArg)
         {
             for (int i = fixedParamCount; i < call.Arguments.Count; i++)
-                PushValueAndType(call.Arguments[i], instId, ops);
+                PushValueAndType(call.Arguments[i], instId, ref ops);
         }
 
         if (call.Fmf != FastMathFlags.None) ops.Add((ulong)call.Fmf);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCall, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCall, ops.Span);
     }
 
     private void WriteExtractElement(ExtractElementInstruction ee, int instId)
     {
-        var ops = new List<ulong>(4);
-        PushValueAndType(ee.Vector, instId, ops);
-        PushValueAndType(ee.Index, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstExtractElt, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[4];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(ee.Vector, instId, ref ops);
+        PushValueAndType(ee.Index, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstExtractElt, ops.Span);
     }
 
     private void WriteInsertElement(InsertElementInstruction ie, int instId)
     {
-        var ops = new List<ulong>(5);
-        PushValueAndType(ie.Vector, instId, ops);
-        PushValue(ie.Element, instId, ops);
-        PushValueAndType(ie.Index, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstInsertElt, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[5];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(ie.Vector, instId, ref ops);
+        PushValue(ie.Element, instId, ref ops);
+        PushValueAndType(ie.Index, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstInsertElt, ops.Span);
     }
 
     private void WriteShuffleVector(ShuffleVectorInstruction sv, int instId)
     {
-        var ops = new List<ulong>(5);
-        PushValueAndType(sv.Vector1, instId, ops);
-        PushValue(sv.Vector2, instId, ops);
-        PushValueAndType(sv.Mask, instId, ops);
-        _w.WriteUnabbrevRecord(FunctionCodes.InstShuffleVec, ops.ToArray());
+        Span<ulong> buf = stackalloc ulong[5];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(sv.Vector1, instId, ref ops);
+        PushValue(sv.Vector2, instId, ref ops);
+        PushValueAndType(sv.Mask, instId, ref ops);
+        _w.WriteUnabbrevRecord(FunctionCodes.InstShuffleVec, ops.Span);
     }
 
     private void WriteFence(FenceInstruction f)
@@ -854,32 +889,32 @@ internal sealed class FunctionWriter
 
     private void WriteAtomicRmw(AtomicRmwInstruction arw, int instId)
     {
-        // [ptr+ty, val, op, vol, ordering, synchscope, align]
-        var ops = new List<ulong>(8);
-        PushValueAndType(arw.Pointer, instId, ops);
-        PushValueAndType(arw.Value, instId, ops);
+        Span<ulong> buf = stackalloc ulong[8];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(arw.Pointer, instId, ref ops);
+        PushValueAndType(arw.Value, instId, ref ops);
         ops.Add(arw.Operation);
         ops.Add(arw.IsVolatile ? 1UL : 0UL);
         ops.Add(arw.Ordering);
         ops.Add(arw.SyncScope);
         ops.Add(EncodedAlign(arw.Alignment));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstAtomicRmw, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstAtomicRmw, ops.Span);
     }
 
     private void WriteCmpXchg(CmpXchgInstruction cx, int instId)
     {
-        // [ptr+ty, cmp+ty, new, vol, success_ordering, synchscope, failure_ordering, weak, align]
-        var ops = new List<ulong>(10);
-        PushValueAndType(cx.Pointer, instId, ops);
-        PushValueAndType(cx.Compare, instId, ops);
-        PushValue(cx.New, instId, ops);
+        Span<ulong> buf = stackalloc ulong[10];
+        var ops = new OpsWriter(buf);
+        PushValueAndType(cx.Pointer, instId, ref ops);
+        PushValueAndType(cx.Compare, instId, ref ops);
+        PushValue(cx.New, instId, ref ops);
         ops.Add(cx.IsVolatile ? 1UL : 0UL);
         ops.Add(cx.SuccessOrdering);
         ops.Add(cx.SyncScope);
         ops.Add(cx.FailureOrdering);
         ops.Add(cx.IsWeak ? 1UL : 0UL);
         ops.Add(EncodedAlign(cx.Alignment));
-        _w.WriteUnabbrevRecord(FunctionCodes.InstCmpXchg, ops.ToArray());
+        _w.WriteUnabbrevRecord(FunctionCodes.InstCmpXchg, ops.Span);
     }
 
     private int BbId(BasicBlock bb)
@@ -889,12 +924,6 @@ internal sealed class FunctionWriter
         return id;
     }
 
-    /// <summary>Walks every instruction operand of <paramref name="fn"/> looking for
-    /// MetadataAsValue wrappers around function-local metadata (MdValue/DiArgList that
-    /// reference an Argument or Instruction of this function). Assigns IDs to them
-    /// starting at <see cref="MetadataEnumerator.ModuleMetadataCount"/> in topological
-    /// order (MdValues before any DiArgList that references them) and emits the
-    /// function-local METADATA_BLOCK via the shared <see cref="MetadataWriter"/>.</summary>
     private void EmitFunctionLocalMetadata(Function fn)
     {
         if (_me is null || _mw is null) return;
@@ -920,11 +949,8 @@ internal sealed class FunctionWriter
         _mw.WriteFunctionLocalMetadataBlock(ordered);
     }
 
-    private void PushValueAndType(Value v, int instId, List<ulong> ops)
+    private void PushValueAndType(Value v, int instId, ref OpsWriter ops)
     {
-        // MetadataAsValue routes through the metadata table — only the 1-based
-        // metadata id is pushed; the reader uses the surrounding signature to
-        // recognize the operand as metadata (no type id).
         if (v is MetadataAsValue mav)
         {
             if (_me is null)
@@ -939,7 +965,7 @@ internal sealed class FunctionWriter
             ops.Add((ulong)v.Type.Id);
     }
 
-    private void PushValue(Value v, int instId, List<ulong> ops)
+    private void PushValue(Value v, int instId, ref OpsWriter ops)
     {
         if (v is MetadataAsValue mav)
         {

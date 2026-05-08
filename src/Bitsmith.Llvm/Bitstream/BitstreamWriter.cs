@@ -259,6 +259,14 @@ public sealed class BitstreamWriter
 
     public void WriteUnabbrevRecord(uint code) => WriteUnabbrevRecord(code, ReadOnlySpan<ulong>.Empty);
 
+    public void WriteUnabbrevRecord(uint code, ulong op0)
+    {
+        WriteAbbrevId(UnabbrevRecordAbbrevId);
+        WriteVBR(code, 6);
+        WriteVBR(1u, 6);
+        WriteVBR64(op0, 6);
+    }
+
     /// <summary>
     /// Defines an abbreviation in the current block. Returns the new abbrev id
     /// (starting at <see cref="FirstUserAbbrevId"/> for the first user-defined abbrev within a block).
@@ -378,6 +386,20 @@ public sealed class BitstreamWriter
 
     public void WriteAbbrevRecord(uint abbrevId, params ulong[] operands)
         => WriteAbbrevRecord(abbrevId, (ReadOnlySpan<ulong>)operands);
+
+    public void WriteAbbrevRecord(uint abbrevId, ulong op0)
+    {
+        Span<ulong> ops = stackalloc ulong[1];
+        ops[0] = op0;
+        WriteAbbrevRecord(abbrevId, (ReadOnlySpan<ulong>)ops);
+    }
+
+    public void WriteAbbrevRecord(uint abbrevId, ulong op0, ulong op1)
+    {
+        Span<ulong> ops = stackalloc ulong[2];
+        ops[0] = op0; ops[1] = op1;
+        WriteAbbrevRecord(abbrevId, (ReadOnlySpan<ulong>)ops);
+    }
 
     /// <summary>
     /// Emits a record using an abbreviation whose final op is <see cref="AbbrevOpKind.Blob"/>.
