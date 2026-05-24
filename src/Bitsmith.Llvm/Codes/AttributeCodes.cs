@@ -81,11 +81,16 @@ public static class AttrKindCodes
     public const uint ByRef = 69;
     public const uint MustProgress = 70;
     public const uint Hot = 72;
-    public const uint AllocAlign = 73;
-    public const uint AllocatedPointer = 74;
-    public const uint DisableSanitizerInstrumentation = 76;
+    public const uint NoProfile = 73;
+    public const uint VScaleRange = 74;
+    public const uint SwiftAsync = 75;
+    public const uint NoSanitizeCoverage = 76;
     public const uint ElementType = 77;
-    public const uint AllocKind = 78;
+    public const uint DisableSanitizerInstrumentation = 78;
     public const uint NoSanitizeBounds = 79;
-    public const uint OptimizeForDebugging = 80;
+    public const uint AllocAlign = 80;
+    public const uint AllocatedPointer = 81;
+    public const uint AllocKind = 82;
+    public const uint PresplitCoroutine = 83;
+    public const uint FnretthunkExtern = 84;
 }

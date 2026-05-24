@@ -298,6 +298,80 @@ public class GlobalsAndAttributesRoundtripTests
     }
 
     [SkippableFact]
+    public void AllocKind_IntAttribute_RoundTrip()
+    {
+        // Regression: AttrKindCodes.AllocKind was 78 (LLVM 15 wire = DISABLE_SANITIZER_INSTRUMENTATION,
+        // Enum-form). Writing it as Int-form produced bitcode that the reader rejects with
+        // "Not an int attribute". Correct LLVM 15 wire value is 82.
+        LlvmTools.Require("llvm-dis");
+
+        var module = new Module
+        {
+            SourceFileName = "alloc_kind.ll",
+            TargetTriple = "x86_64-unknown-linux-gnu",
+            DataLayout = "e-m:e-p:64:64-i64:64-n8:16:32:64-S128",
+        };
+        var t = module.Types;
+        var ptr = t.GetPointer();
+        var fnTy = t.GetFunction(ptr, new LlvmType[] { t.Int64 });
+        var fn = module.CreateFunction("my_alloc", fnTy);
+        // allockind("alloc,uninitialized") -> bits Alloc(1) | Uninitialized(8) = 9
+        fn.FunctionAttributes.Add(IR.Attribute.Int(AttrKindCodes.AllocKind, 1UL | 8UL));
+
+        var bcPath = Path.GetTempFileName() + ".bc";
+        var llPath = bcPath + ".ll";
+        try
+        {
+            new ModuleWriter(module).WriteToFile(bcPath);
+            var r = LlvmTools.Run("llvm-dis", bcPath, "-o", llPath);
+            Assert.True(r.ExitCode == 0, $"llvm-dis failed: {r.StdErr}");
+            var ll = File.ReadAllText(llPath);
+            Assert.Contains("allockind(\"alloc,uninitialized\")", ll);
+        }
+        finally
+        {
+            if (File.Exists(bcPath)) File.Delete(bcPath);
+            if (File.Exists(llPath)) File.Delete(llPath);
+        }
+    }
+
+    [SkippableFact]
+    public void AllocAlign_EnumAttribute_RoundTrip()
+    {
+        // Regression: AllocAlign was 73 (LLVM 15 wire = NO_PROFILE). Silent miscompile —
+        // bitcode loads but the parameter gets tagged with the wrong attribute. Correct = 80.
+        LlvmTools.Require("llvm-dis");
+
+        var module = new Module
+        {
+            SourceFileName = "alloc_align.ll",
+            TargetTriple = "x86_64-unknown-linux-gnu",
+            DataLayout = "e-m:e-p:64:64-i64:64-n8:16:32:64-S128",
+        };
+        var t = module.Types;
+        var ptr = t.GetPointer();
+        var fnTy = t.GetFunction(ptr, new LlvmType[] { t.Int64 });
+        var fn = module.CreateFunction("aligned_alloc_wrap", fnTy);
+        fn.GetParameterAttributes(0).Add(IR.Attribute.Enum(AttrKindCodes.AllocAlign));
+
+        var bcPath = Path.GetTempFileName() + ".bc";
+        var llPath = bcPath + ".ll";
+        try
+        {
+            new ModuleWriter(module).WriteToFile(bcPath);
+            var r = LlvmTools.Run("llvm-dis", bcPath, "-o", llPath);
+            Assert.True(r.ExitCode == 0, $"llvm-dis failed: {r.StdErr}");
+            var ll = File.ReadAllText(llPath);
+            Assert.Contains("allocalign", ll);
+        }
+        finally
+        {
+            if (File.Exists(bcPath)) File.Delete(bcPath);
+            if (File.Exists(llPath)) File.Delete(llPath);
+        }
+    }
+
+    [SkippableFact]
     public void StringAttributes_RoundTrip()
     {
         LlvmTools.Require("llvm-dis");
