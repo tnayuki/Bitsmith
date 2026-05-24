@@ -23,7 +23,7 @@ public static class BlockIds
     public const uint OperandBundleTags = 21;
     public const uint MetadataKind = 22;
     public const uint Strtab = 23;
-    public const uint FullLtoGlobalvarSummary = 24;
+    public const uint FullLtoGlobalvalSummary = 24;
     public const uint Symtab = 25;
     public const uint SyncScopeNames = 26;
 }

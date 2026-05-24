@@ -53,7 +53,7 @@ public sealed class ModuleWriter
         // String-record abbrev: [Vbr(6) code, Array, Fixed(8) byte].
         // Used for the Producer string; the reader expands the array length itself.
         var strAbbrev = w.DefineAbbrev(AbbrevOp.Vbr(6), AbbrevOp.Array(), AbbrevOp.Fixed(8));
-        WriteAbbrevString(w, strAbbrev, IdentificationCodes.Producer, _module.ProducerString);
+        WriteAbbrevString(w, strAbbrev, IdentificationCodes.String, _module.ProducerString);
 
         w.WriteUnabbrevRecord(IdentificationCodes.Epoch, IdentificationCodes.CurrentEpoch);
         w.ExitBlock();

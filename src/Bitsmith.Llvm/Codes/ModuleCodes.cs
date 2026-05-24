@@ -25,7 +25,7 @@ public static class ModuleCodes
 /// <summary>Record codes inside IDENTIFICATION_BLOCK.</summary>
 public static class IdentificationCodes
 {
-    public const uint Producer = 1;
+    public const uint String = 1;
     public const uint Epoch = 2;
 
     /// <summary>Current bitcode epoch as of LLVM 15.</summary>
