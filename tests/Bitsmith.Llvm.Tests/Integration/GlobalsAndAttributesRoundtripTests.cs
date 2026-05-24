@@ -372,6 +372,43 @@ public class GlobalsAndAttributesRoundtripTests
     }
 
     [SkippableFact]
+    public void AllocSize_IntAttribute_RoundTrip()
+    {
+        // allocsize(N) / allocsize(N, M) — packs the argument indices into a 64-bit value.
+        // Encoding: (sizeArg << 32) | numArg ; numArg absent == 0xFFFFFFFF sentinel.
+        LlvmTools.Require("llvm-dis");
+
+        var module = new Module
+        {
+            SourceFileName = "alloc_size.ll",
+            TargetTriple = "x86_64-unknown-linux-gnu",
+            DataLayout = "e-m:e-p:64:64-i64:64-n8:16:32:64-S128",
+        };
+        var t = module.Types;
+        var ptr = t.GetPointer();
+        var fnTy = t.GetFunction(ptr, new LlvmType[] { t.Int64 });
+        var fn = module.CreateFunction("my_malloc", fnTy);
+        // allocsize(0): sizeArg=0, numArg absent. Encoded as (0 << 32) | 0xFFFFFFFF.
+        fn.FunctionAttributes.Add(IR.Attribute.Int(AttrKindCodes.AllocSize, 0xFFFFFFFFUL));
+
+        var bcPath = Path.GetTempFileName() + ".bc";
+        var llPath = bcPath + ".ll";
+        try
+        {
+            new ModuleWriter(module).WriteToFile(bcPath);
+            var r = LlvmTools.Run("llvm-dis", bcPath, "-o", llPath);
+            Assert.True(r.ExitCode == 0, $"llvm-dis failed: {r.StdErr}");
+            var ll = File.ReadAllText(llPath);
+            Assert.Contains("allocsize(0)", ll);
+        }
+        finally
+        {
+            if (File.Exists(bcPath)) File.Delete(bcPath);
+            if (File.Exists(llPath)) File.Delete(llPath);
+        }
+    }
+
+    [SkippableFact]
     public void StringAttributes_RoundTrip()
     {
         LlvmTools.Require("llvm-dis");
